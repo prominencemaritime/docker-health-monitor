@@ -295,7 +295,7 @@ sudo systemctl stop docker-health-monitor
 # Start the service
 sudo systemctl start docker-health-monitor
 
-# Restart the service
+# Restart the service (e.g. after editing .env)
 sudo systemctl restart docker-health-monitor
 
 # Disable service (won't start on boot)
