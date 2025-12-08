@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+Multi-Project Docker Health Monitor
+
+Monitors all Docker containers across multiple projects with healthchecks
+and sends email alerts with project context when containers become unhealthy.
+
+Features:
+- Monitors all containers with healthchecks automatically
+- Project-aware alerts (includes project context)
+- Project-specific alert routing (optional)
+- Tracks container state across all projects
+- Includes container logs in alert emails
+- Configurable check interval
+- Graceful shutdown handling
+
+Usage:
+    python docker_health_monitor.py
+    
+Directory Structure:
+    /master_folder/
+    ├── _docker_monitoring/          # Run the script from here
+    │   ├── docker_health_monitor.py
+    │   ├── .env
+    │   └── logs/
+    ├── passage_plan/                # Project 1
+    │   └── docker-compose.yml
+    ├── vessel_certificates/         # Project 2
+    │   └── docker-compose.yml
+    └── hot_works_alerts/            # Project 3
+        └── docker-compose.yml
+
+Requirements:
+    - docker>=7.0.0
+    - python-decouple
+"""
+
+import docker
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+import time
+import signal
+import sys
+from typing import Dict, Optional, List
+from decouple import config
+import logging
+from logging.handlers import RotatingFileHandler
+import re
+
+
+# Configure logging with rotation
+log_file = '/srv/repos/_docker_monitoring/logs/monitor.log'
+file_handler = RotatingFileHandler(
+    log_file,
+    maxBytes=10_485_760,  # 10MB
+    backupCount=5          # Keep 5 old files
+)
+file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[console_handler, file_handler]
+)
+logger = logging.getLogger(__name__)
+
+
+class MultiProjectHealthMonitor:
+    """Monitor Docker container health across multiple projects."""
+    
+    def __init__(self):
+        """Initialize the health monitor."""
+        self.client = docker.from_env()
+        self.container_states: Dict[str, Dict] = {}  # container_name -> {status, project, last_check}
+        self.shutdown_requested = False
+        
+        # Load configuration
+        self.smtp_host = config('SMTP_HOST')
+        self.smtp_port = int(config('SMTP_PORT', default=465))
+        self.smtp_user = config('SMTP_USER')
+        self.smtp_pass = config('SMTP_PASS')
+        
+        # Default alert recipients
+        self.default_recipients = [
+            email.strip() 
+            for email in config('HEALTH_CHECK_ALERT_EMAILS', default='').split(',')
+            if email.strip()
+        ]
+        
+        # Project-specific routing (optional)
+        self.project_routing = self._load_project_routing()
+        
+        self.check_interval = int(config('HEALTH_CHECK_INTERVAL', default=30))
+        self.log_tail_lines = int(config('HEALTH_CHECK_LOG_LINES', default=50))
+        self.server_name = config('SERVER_NAME', default='Production')
+        
+        # Validate configuration
+        if not self.default_recipients:
+            raise ValueError("HEALTH_CHECK_ALERT_EMAILS must be configured in .env")
+        
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        
+        logger.info("=" * 70)
+        logger.info("Multi-Project Docker Health Monitor initialized")
+        logger.info(f"Server: {self.server_name}")
+        logger.info(f"Default alert recipients: {', '.join(self.default_recipients)}")
+        logger.info(f"Check interval: {self.check_interval} seconds")
+        if self.project_routing:
+            logger.info(f"Project-specific routing configured for: {', '.join(self.project_routing.keys())}")
+        logger.info("=" * 70)
+    
+    def _load_project_routing(self) -> Dict[str, List[str]]:
+        """
+        Load project-specific alert routing from environment.
+        
+        Format in .env:
+        CONTAINER_ALERT_ROUTING=passage-plan:email1@ex.com,email2@ex.com;vessel-cert:email3@ex.com
+        
+        Returns:
+            Dict mapping container name patterns to recipient lists
+        """
+        routing_str = config('CONTAINER_ALERT_ROUTING', default='')
+        if not routing_str:
+            return {}
+        
+        routing = {}
+        for mapping in routing_str.split(';'):
+            if ':' not in mapping:
+                continue
+            pattern, emails = mapping.split(':', 1)
+            recipients = [e.strip() for e in emails.split(',') if e.strip()]
+            if recipients:
+                routing[pattern.strip()] = recipients
+        
+        return routing
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        logger.info(f"Received signal {signum}. Shutting down gracefully...")
+        self.shutdown_requested = True
+    
+    def _get_project_name(self, container) -> str:
+        """
+        Extract project name from container labels or name.
+        
+        Args:
+            container: Docker container object
+            
+        Returns:
+            Project name string
+        """
+        # Try to get from docker-compose labels
+        labels = container.labels
+        
+        # Check common docker-compose labels
+        if 'com.docker.compose.project' in labels:
+            return labels['com.docker.compose.project']
+        
+        # Fallback: extract from container name
+        # Docker compose typically names containers: projectname-servicename-1
+        container_name = container.name
+        match = re.match(r'^([^-]+)-', container_name)
+        if match:
+            return match.group(1)
+        
+        return 'unknown'
+    
+    def _get_recipients_for_container(self, container_name: str, project_name: str) -> List[str]:
+        """
+        Get recipient list for a specific container.
+        
+        Checks project-specific routing first, then falls back to default.
+        
+        Args:
+            container_name: Name of the container
+            project_name: Project/compose name
+            
+        Returns:
+            List of email addresses to notify
+        """
+        # Check if there's project-specific routing
+        for pattern, recipients in self.project_routing.items():
+            if pattern in container_name or pattern in project_name:
+                logger.debug(f"Using project-specific routing for {container_name}: {recipients}")
+                return recipients
+        
+        # Fall back to default recipients
+        return self.default_recipients
+    
+    def send_alert_email(
+        self, 
+        container_name: str,
+        project_name: str,
+        status: str, 
+        details: str,
+        previous_status: Optional[str] = None,
+        recipients: Optional[List[str]] = None
+    ):
+        """
+        Send email alert for health check status change.
+        
+        Args:
+            container_name: Name of the container
+            project_name: Project/compose name
+            status: Current health status
+            details: Additional details (logs, error messages)
+            previous_status: Previous health status
+            recipients: Override recipient list
+        """
+        if recipients is None:
+            recipients = self._get_recipients_for_container(container_name, project_name)
+        
+        # Determine alert severity
+        if status == 'unhealthy':
+            emoji = '<< XXX >>'
+            severity = 'CRITICAL'
+        elif status == 'not_found':
+            emoji = '<< XX >>'
+            severity = 'ERROR'
+        elif status == 'starting':
+            emoji = '<< X >>'
+            severity = 'WARNING'
+        else:
+            emoji = '<< 1 >>'
+            severity = 'INFO'
+        
+        subject = f"{emoji} {severity}: [{project_name}] {container_name} - Health Status Changed"
+        
+        # Build email body
+        status_change = f"{previous_status} → {status}" if previous_status else status
+        
+        body = f"""
+Docker Container Health Alert
+==============================
+
+Server:          {self.server_name}
+Project:         {project_name}
+Container:       {container_name}
+Status Change:   {status_change}
+Severity:        {severity}
+Time:            {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Details:
+--------
+{details}
+
+Action Required:
+----------------
+"""
+        
+        if status == 'unhealthy':
+            body += f"""
+1. Check container logs:
+   docker logs {container_name}
+
+2. Inspect container:
+   docker inspect {container_name}
+
+3. Restart container:
+   docker restart {container_name}
+   
+   Or navigate to project and restart:
+   cd /path/to/{project_name}
+   docker compose restart
+
+4. Check application health endpoint
+
+5. Review recent code changes or deployments
+"""
+        elif status == 'not_found':
+            body += f"""
+1. Check if container is running:
+   docker ps -a | grep {container_name}
+
+2. Navigate to project directory:
+   cd /path/to/{project_name}
+
+3. Check docker-compose status:
+   docker compose ps
+
+4. Restart services:
+   docker compose up -d
+
+5. Check docker-compose.yml configuration
+"""
+        else:
+            body += """
+Monitor the situation and check logs for more information.
+"""
+        
+        body += f"""
+
+Project Context:
+----------------
+Container name: {container_name}
+Project name:   {project_name}
+Status:         {status}
+
+---
+Automated alert from Multi-Project Docker Health Monitor
+Server: {self.server_name}
+Monitoring all containers with healthchecks
+"""
+        
+        # Create email message
+        msg = MIMEMultipart()
+        msg['From'] = self.smtp_user
+        msg['To'] = ', '.join(recipients)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Send email
+        try:
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port) as server:
+                server.login(self.smtp_user, self.smtp_pass)
+                server.send_message(msg)
+            logger.info(f"✓ Alert sent for [{project_name}] {container_name} to {', '.join(recipients)}")
+        except Exception as e:
+            logger.error(f"✗ Failed to send alert email: {e}")
+    
+    def get_container_health(self, container) -> Optional[str]:
+        """
+        Get health status of a container.
+        
+        Args:
+            container: Docker container object
+            
+        Returns:
+            Health status string or None if no healthcheck
+        """
+        try:
+            container.reload()  # Refresh container state
+            health = container.attrs.get('State', {}).get('Health', {})
+            return health.get('Status')
+        except Exception as e:
+            logger.error(f"Error getting health for {container.name}: {e}")
+            return None
+    
+    def get_container_logs(self, container, tail: int = 50) -> str:
+        """
+        Get recent logs from a container.
+        
+        Args:
+            container: Docker container object
+            tail: Number of lines to retrieve
+            
+        Returns:
+            Container logs as string
+        """
+        try:
+            logs = container.logs(tail=tail).decode('utf-8', errors='replace')
+            return logs
+        except Exception as e:
+            return f"Could not retrieve logs: {e}"
+    
+    def check_container(self, container):
+        """
+        Check health status of a single container.
+        
+        Args:
+            container: Docker container object
+        """
+        container_name = container.name
+        project_name = self._get_project_name(container)
+        current_status = self.get_container_health(container)
+        
+        # Skip containers without healthchecks
+        if current_status is None:
+            return
+        
+        # Get previous state
+        previous_state = self.container_states.get(container_name, {})
+        previous_status = previous_state.get('status')
+        
+        # Check for status change
+        if current_status != previous_status:
+            logger.info(f"[{project_name}] {container_name}: {previous_status or 'unknown'} → {current_status}")
+            
+            # Send alert for unhealthy or critical status changes
+            if current_status in ['unhealthy', 'starting'] or (
+                previous_status == 'healthy' and current_status != 'healthy'
+            ):
+                logs = self.get_container_logs(container, tail=self.log_tail_lines)
+                details = f"Recent logs:\n\n{logs}"
+                
+                self.send_alert_email(
+                    container_name=container_name,
+                    project_name=project_name,
+                    status=current_status,
+                    details=details,
+                    previous_status=previous_status
+                )
+        
+        # Update state
+        self.container_states[container_name] = {
+            'status': current_status,
+            'project': project_name,
+            'last_check': datetime.now()
+        }
+    
+    def check_all_containers(self):
+        """Check health status of all running containers across all projects."""
+        try:
+            containers = self.client.containers.list()
+            
+            # Track which containers we've seen this round
+            seen_containers = set()
+            
+            # Group containers by project for logging
+            projects = {}
+            
+            for container in containers:
+                seen_containers.add(container.name)
+                project_name = self._get_project_name(container)
+                
+                if project_name not in projects:
+                    projects[project_name] = []
+                projects[project_name].append(container.name)
+                
+                self.check_container(container)
+            
+            # Log summary
+            if projects:
+                logger.debug(f"Monitoring {len(containers)} container(s) across {len(projects)} project(s):")
+                for project, container_names in projects.items():
+                    logger.debug(f"  [{project}]: {len(container_names)} container(s)")
+            
+            # Check for containers that disappeared
+            for container_name, state in list(self.container_states.items()):
+                if container_name not in seen_containers:
+                    previous_status = state['status']
+                    project_name = state['project']
+                    
+                    logger.warning(f"[{project_name}] {container_name}: Container no longer running")
+                    
+                    self.send_alert_email(
+                        container_name=container_name,
+                        project_name=project_name,
+                        status='not_found',
+                        details='Container is no longer running or has been removed.',
+                        previous_status=previous_status
+                    )
+                    
+                    # Remove from tracking
+                    del self.container_states[container_name]
+        
+        except Exception as e:
+            logger.error(f"Error checking containers: {e}")
+    
+    def run(self):
+        """Run the health monitoring loop."""
+        logger.info("=" * 70)
+        logger.info("▶ MULTI-PROJECT DOCKER HEALTH MONITOR STARTED")
+        logger.info("=" * 70)
+        
+        try:
+            # Initial check
+            self.check_all_containers()
+            
+            # Main monitoring loop
+            while not self.shutdown_requested:
+                time.sleep(self.check_interval)
+                
+                if self.shutdown_requested:
+                    break
+                
+                self.check_all_containers()
+        
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+        
+        except Exception as e:
+            logger.exception(f"Fatal error in monitoring loop: {e}")
+        
+        finally:
+            logger.info("=" * 70)
+            logger.info("◼ MULTI-PROJECT DOCKER HEALTH MONITOR STOPPED")
+            logger.info("=" * 70)
+
+
+def main():
+    """Main entry point."""
+    try:
+        monitor = MultiProjectHealthMonitor()
+        monitor.run()
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Failed to start health monitor: {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
