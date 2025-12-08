@@ -1,6 +1,6 @@
 # Multi-Project Docker Health Monitor
 
-A centralised docker container health monitoring system, with healthchecks across multiple projects. An email alert is sent when containers become unhealthy.
+A centralised health monitoring system that watches all Docker containers with healthchecks across multiple projects and sends email alerts when containers become unhealthy.
 
 ## Overview
 
@@ -21,8 +21,10 @@ This monitoring system:
 │   ├── .env                         # Configuration
 │   ├── requirements.txt             # Python dependencies
 │   ├── logs/                        # Log directory
-│   │   ├── monitor.log              # Application logs
-│   │   └── monitor_error.log        # Error logs
+│   │   ├── monitor.log              # Current log file
+│   │   ├── monitor.log.1            # Rotated log (most recent)
+│   │   ├── monitor.log.2            # Rotated log (older)
+│   │   └── ...                      # Up to monitor.log.5
 │   └── README.md                    # This file
 │
 ├── passage_plan/                    # Your project 1
@@ -145,8 +147,6 @@ EOF
 
 ```bash
 vim .env
-# or
-nano .env
 ```
 
 ### Step 5: Test the Monitor
@@ -180,7 +180,7 @@ Press `Ctrl+C` to stop it.
 Create the systemd service file:
 
 ```bash
-sudo nano /etc/systemd/system/docker-health-monitor.service
+sudo vim /etc/systemd/system/docker-health-monitor.service
 ```
 
 Paste this content (replace `/path/to/master_folder` with your actual path):
@@ -188,7 +188,7 @@ Paste this content (replace `/path/to/master_folder` with your actual path):
 ```ini
 [Unit]
 Description=Multi-Project Docker Health Monitor
-Documentation=https://github.com/your-org/docker-health-monitor
+Documentation=https://github.com/prominencemaritime/docker-health-monitor
 After=docker.service
 Requires=docker.service
 
@@ -201,8 +201,6 @@ Environment="PATH=/usr/bin:/usr/local/bin"
 ExecStart=/usr/bin/python3 /path/to/master_folder/_docker_monitoring/docker_health_monitor.py
 Restart=always
 RestartSec=10
-StandardOutput=append:/path/to/master_folder/_docker_monitoring/logs/monitor.log
-StandardError=append:/path/to/master_folder/_docker_monitoring/logs/monitor_error.log
 
 # Security settings
 NoNewPrivileges=true
@@ -211,6 +209,10 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 ```
+
+**Note:** The monitoring script writes logs to both locations:
+- File logs: `/path/to/master_folder/_docker_monitoring/logs/monitor.log` (with automatic rotation)
+- Systemd journal: viewable with `journalctl -u docker-health-monitor`
 
 ### Step 7: Enable and Start the Service
 
@@ -245,11 +247,27 @@ You should see:
 
 ### View Logs
 
+The monitor writes logs to **both** file and systemd journal:
+
+**File Logs** (recommended for most use cases):
 ```bash
-# View real-time logs
+# View real-time file logs
 tail -f _docker_monitoring/logs/monitor.log
 
-# View systemd journal logs
+# View last 100 lines
+tail -n 100 _docker_monitoring/logs/monitor.log
+
+# Search for specific container
+grep "passage-plan-app" _docker_monitoring/logs/monitor.log
+
+# View all log files (including rotated backups)
+ls -lh _docker_monitoring/logs/
+# You'll see: monitor.log, monitor.log.1, monitor.log.2, etc.
+```
+
+**Systemd Journal** (alternative method):
+```bash
+# View real-time systemd logs
 sudo journalctl -u docker-health-monitor -f
 
 # View last 100 lines
@@ -258,6 +276,12 @@ sudo journalctl -u docker-health-monitor -n 100
 # View logs since a specific time
 sudo journalctl -u docker-health-monitor --since "1 hour ago"
 ```
+
+**Log Rotation:**
+- Log files are automatically rotated when they reach 10MB
+- Up to 5 backup files are kept (monitor.log.1 through monitor.log.5)
+- Oldest logs are automatically deleted
+- No manual maintenance required
 
 ### Manage the Service
 
@@ -365,7 +389,7 @@ The monitor matches container names or project names against these patterns.
 ## Alert Email Example
 
 ```
-Subject: 🚨 CRITICAL: [passage-plan] passage-plan-app - Health Status Changed
+Subject: CRITICAL: [passage-plan] passage-plan-app - Health Status Changed
 
 Docker Container Health Alert
 ==============================
@@ -415,10 +439,13 @@ Action Required:
 # Check service status
 sudo systemctl status docker-health-monitor
 
-# View recent logs
+# View recent systemd logs
 sudo journalctl -u docker-health-monitor -n 50
 
-# Check for Python errors
+# View recent file logs
+tail -n 50 /path/to/_docker_monitoring/logs/monitor.log
+
+# Check for Python errors by running manually
 python3 /path/to/_docker_monitoring/docker_health_monitor.py
 ```
 
@@ -445,7 +472,11 @@ python3 /path/to/_docker_monitoring/docker_health_monitor.py
 
 3. **Check monitor logs**:
    ```bash
+   # Check file logs
    tail -f _docker_monitoring/logs/monitor.log
+   
+   # Or check systemd logs
+   sudo journalctl -u docker-health-monitor -f
    ```
 
 ### Containers Not Being Monitored
@@ -484,15 +515,46 @@ docker stats
 
 ### Log Rotation
 
-Logs are automatically managed by systemd. To configure rotation:
+Log files are **automatically rotated** by the monitor:
+- When `monitor.log` reaches 10MB, it's renamed to `monitor.log.1`
+- Previous backups are shifted: `monitor.log.1` → `monitor.log.2`, etc.
+- Maximum of 5 backup files are kept
+- Oldest backup is automatically deleted
 
 ```bash
-sudo nano /etc/systemd/journald.conf
+# View all log files
+ls -lh _docker_monitoring/logs/
+# Output:
+# monitor.log      (current, up to 10MB)
+# monitor.log.1    (previous)
+# monitor.log.2    (older)
+# monitor.log.3
+# monitor.log.4
+# monitor.log.5    (oldest, will be deleted on next rotation)
 
-# Set:
-SystemMaxUse=500M
-SystemMaxFileSize=50M
-MaxRetentionSec=2week
+# Total disk space used (typically < 60MB)
+du -sh _docker_monitoring/logs/
+```
+
+**Manual log cleanup** (if needed):
+```bash
+# Remove old rotated logs (keeps current monitor.log)
+rm _docker_monitoring/logs/monitor.log.[1-5]
+
+# Clear current log (start fresh)
+> _docker_monitoring/logs/monitor.log
+```
+
+**Systemd journal logs** are managed separately:
+```bash
+# View journal disk usage
+sudo journalctl --disk-usage
+
+# Clean journals older than 2 weeks
+sudo journalctl --vacuum-time=2weeks
+
+# Limit journal to 500MB
+sudo journalctl --vacuum-size=500M
 ```
 
 ### Backup Configuration
@@ -503,6 +565,9 @@ cp _docker_monitoring/.env _docker_monitoring/.env.backup
 
 # Backup with timestamp
 cp _docker_monitoring/.env _docker_monitoring/.env.$(date +%Y%m%d)
+
+# Backup logs directory (includes all rotated logs)
+tar -czf logs-backup-$(date +%Y%m%d).tar.gz _docker_monitoring/logs/
 ```
 
 ### Updates
@@ -538,6 +603,21 @@ sudo systemctl start docker-health-monitor
    ```
 
 3. **Service Isolation**: The systemd service runs with `NoNewPrivileges=true` and `PrivateTmp=true`
+
+## Monitor the Monitor (Optional)
+
+Set up a cron job to ensure the monitoring service itself stays running:
+
+```bash
+# Edit crontab
+crontab -e
+# When prompted, select vim: Choose option 1 or 3
+
+# Add this line (checks every 5 minutes)
+*/5 * * * * systemctl is-active --quiet docker-health-monitor || systemctl start docker-health-monitor
+```
+
+This checks every 5 minutes if the service is running and starts it if stopped.
 
 ## Adding New Projects
 
@@ -583,7 +663,6 @@ For issues or questions:
 - Review logs: `tail -f _docker_monitoring/logs/monitor.log`
 - Check systemd status: `sudo systemctl status docker-health-monitor`
 
-
 ## Changelog
 
 ### Version 1.0.0 (2025-12-08)
@@ -592,4 +671,3 @@ For issues or questions:
 - Email alerting with project context
 - Project-specific alert routing
 - Systemd service integration
-
