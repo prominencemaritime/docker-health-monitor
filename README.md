@@ -1,6 +1,7 @@
 # Multi-Project Docker Health Monitor
 
 A centralised health monitoring system that watches all Docker containers with healthchecks across multiple projects and sends email alerts when containers become unhealthy.
+For the repository click here: [GitHub Repo](https://github.com/prominencemaritime/docker-health-monitor)
 
 ## Overview
 
@@ -27,22 +28,22 @@ This monitoring system:
 │   │   └── ...                      # Up to monitor.log.5
 │   └── README.md                    # This file
 │
-├── passage_plan/                    # Your project 1
+├── passage_plan/                    # Alert Project 1
 │   ├── docker-compose.yml
 │   ├── .env
 │   └── ...
 │
-├── vessel_certificates/             # Your project 2
+├── vessel_certificates/             # Alert Project 2
 │   ├── docker-compose.yml
 │   ├── .env
 │   └── ...
 │
-├── hot_works_alerts/                # Your project 3
+├── events_alerts/                # Alert Project 3
 │   ├── docker-compose.yml
 │   ├── .env
 │   └── ...
 │
-└── another_project/                 # Your project N
+└── another_project/                 # Alert Project N
     ├── docker-compose.yml
     ├── .env
     └── ...
@@ -61,7 +62,7 @@ This monitoring system:
 ### Step 1: Create Monitoring Directory
 
 ```bash
-# Navigate to your master folder
+# Navigate to your master folder (that contains all dockerised alerts containers)
 cd /path/to/master_folder
 
 # Create monitoring directory
@@ -98,7 +99,7 @@ pip install -r requirements.txt
 
 ### Step 4: Configure Environment Variables
 
-Create `.env` file in the `_docker_monitoring` directory:
+Create `.env` file in the `_docker_monitoring` directory. A template has been provided in `.env.example`.
 
 ```bash
 cat > .env << 'EOF'
