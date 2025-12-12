@@ -1,4 +1,6 @@
 .env
+.env.backup
 logs/*.log
 *.swp
 *.swo
+*.swn

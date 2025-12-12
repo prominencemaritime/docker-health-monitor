@@ -1,20 +1,163 @@
 # Multi-Project Docker Health Monitor
 
 A centralized health monitoring system that watches all Docker containers with healthchecks across multiple projects and sends email alerts when containers become unhealthy.
-## Quick Start: Health Monitoring Setup
 
-### One-Time Setup Per Project
+**Complete Guide:** See [README_LONG.md](README_LONG.md) for comprehensive documentation
 
-**Files to modify:** `src/core/base_alert.py`, `Dockerfile`, and for time-based scheduling also `src/core/scheduler.py` + `src/main.py`
+## Quickstart
+```bash
+# From your master folder containing all alert projects
+cd /srv/repos/alerts
+mkdir -p _docker_health_monitor/logs
+cp /path/to/docker_health_monitor.py _docker_health_monitor/
+cd _docker_health_monitor
 
-#### 1. Update `src/core/base_alert.py`
+# Create .env file with your SMTP settings
+vim .env
+chmod 600 .env
 
-Add to imports:
+# Install dependencies and test
+pip3 install docker python-decouple --break-system-packages
+python3 docker_health_monitor.py
+
+# When working correctly, install as systemd service
+sudo vim /etc/systemd/system/docker-health-monitor.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-health-monitor
+sudo systemctl status docker-health-monitor
+```
+
+## Quick Configuration
+
+Create `.env` file:
+```bash
+# Email Configuration
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USER=your-email@example.com
+SMTP_PASS=your-app-password
+
+# Alert Recipients (required)
+HEALTH_CHECK_ALERT_EMAILS=ops-team@example.com,admin@example.com
+
+# Optional: Project-specific routing
+CONTAINER_ALERT_ROUTING=passage-plan:maritime@ex.com;vessel-cert:compliance@ex.com
+
+# Monitoring Configuration
+HEALTH_CHECK_INTERVAL_SEC=30        # Check every 30 seconds
+WAIT_AND_CHECK_AGAIN_MIN=10         # Wait 10 min before alerting (filters transients)
+HEALTH_USE_BACKOFF=false            # Simple retry (set true for exponential backoff)
+HEALTH_MAX_ATTEMPTS=1               # One retry before alert
+MONITOR_MAX_WORKERS=30              # Parallel worker threads (scales to 50+ containers)
+HEALTH_CHECK_LOG_LINES=50
+SERVER_NAME=Production Server
+MONITOR_LOG_FILE=/srv/repos/alerts/_docker_health_monitor/logs/monitor.log
+```
+
+### Advanced Settings (Optional)
+
+For larger deployments or flapping containers:
+```bash
+# Enable these for more sophisticated retry behavior
+WAIT_AND_CHECK_AGAIN_MIN=5          # Faster first check
+HEALTH_USE_BACKOFF=true             # Exponential backoff (5min → 10min → 20min)
+HEALTH_MAX_ATTEMPTS=3               # Multiple retries
+HEALTH_BACKOFF_MULTIPLIER=2.0
+HEALTH_BACKOFF_MAX_MIN=30.0
+HEALTH_RETRY_JITTER_SEC=5.0
+```
+
+## How It Works
+
+**Smart Retry Logic (Reduces False Positives):**
+1. Container becomes unhealthy at 12:00
+2. Monitor waits 10 minutes (configurable)
+3. Re-checks at 12:10
+4. Only sends alert if still unhealthy
+5. Prevents alerts for transient failures
+
+**Key Features:**
+- ✓ Parallel container checks (fast even with 50+ containers)
+- ✓ Thread-safe state management
+- ✓ Prevents duplicate retry tasks
+- ✓ Configurable retry strategy (simple or exponential backoff)
+- ✓ Graceful shutdown (waits for pending checks)
+- ✓ Auto-discovers new containers
+- ✓ Project-aware alerting
+
+## Systemd Service
+
+Create `/etc/systemd/system/docker-health-monitor.service`:
+```ini
+[Unit]
+Description=Multi-Project Docker Health Monitor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=prominence
+Group=prominence
+WorkingDirectory=/srv/repos/alerts/_docker_health_monitor
+Environment="PATH=/usr/bin:/usr/local/bin"
+ExecStart=/usr/bin/python3 /srv/repos/alerts/_docker_health_monitor/docker_health_monitor.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-health-monitor
+```
+
+## Quick Commands
+```bash
+# View container health status
+docker ps --format "table {{.Names}}\t{{.Status}}"
+
+# View only unhealthy containers
+docker ps --filter health=unhealthy
+
+# Check specific container health
+docker inspect <container-name> --format='{{.State.Health.Status}}'
+
+# View monitor logs
+tail -f /srv/repos/alerts/_docker_health_monitor/logs/monitor.log
+
+# Restart monitor
+sudo systemctl restart docker-health-monitor
+```
+
+## Per-Project Health Monitoring Setup
+
+Each alert project needs health status monitoring configured.
+
+### Files to Modify
+
+**Required for all projects:**
+1. `src/core/base_alert.py` - Writes health status after each run
+2. `Dockerfile` - Reads health status in HEALTHCHECK
+
+**Additional for time-based scheduling (SCHEDULE_TIMES):**
+3. `src/core/scheduler.py` - Writes health after scheduler runs
+4. `src/main.py` - Passes logs_dir to scheduler
+
+### Quick Setup (Frequency-Based Projects)
+
+**1. Update `src/core/base_alert.py`:**
+
+Add import:
 ```python
 from pathlib import Path
 ```
 
-Add this method after `_send_notifications`:
+Add method after `_send_notifications`:
 ```python
 def _write_health_status(self, status: str, run_time: datetime, error_msg: str = "") -> None:
     """Write health status for Docker healthcheck."""
@@ -30,26 +173,21 @@ def _write_health_status(self, status: str, run_time: datetime, error_msg: str =
         self.logger.error(f"Failed to write health status: {e}")
 ```
 
-In `run()` method, add health status writes:
+Add health writes in `run()` method:
 ```python
-# After successful notifications (around line 195)
-success = self._send_notifications(notification_jobs, run_time)
-self._write_health_status("OK", run_time)  # ADD THIS
-return success
+# After successful notifications
+self._write_health_status("OK", run_time)
 
-# In exception handler (around line 208)
-except Exception as e:
-    self.logger.exception(f"Error in {self.__class__.__name__}.run(): {e}")
-    self._write_health_status("ERROR", run_time, str(e))  # ADD THIS
-    return False
+# In exception handler
+self._write_health_status("ERROR", run_time, str(e))
 
-# On early returns - add to all 3 locations (around lines 161, 173, 182)
-self._write_health_status("OK", run_time)  # ADD BEFORE each return False
+# Before each early return False (3 locations)
+self._write_health_status("OK", run_time)
 ```
 
-#### 2. Update `Dockerfile`
+**2. Update `Dockerfile`:**
 
-Replace HEALTHCHECK line with:
+Replace HEALTHCHECK with:
 ```dockerfile
 HEALTHCHECK --interval=30m --timeout=10s --start-period=30s --retries=3 \
   CMD test -f /app/logs/health_status.txt && \
@@ -58,42 +196,42 @@ HEALTHCHECK --interval=30m --timeout=10s --start-period=30s --retries=3 \
       grep -q "^OK" /app/logs/health_status.txt || exit 1
 ```
 
-#### 3. For Time-Based Scheduling Only (SCHEDULE_TIMES set)
+**3. Deploy:**
+```bash
+docker compose build --no-cache && docker compose up -d
+```
 
-**Check if needed:** `grep SCHEDULE_TIMES .env` - if set and not empty, apply these:
+### Time-Based Projects (SCHEDULE_TIMES)
 
-**In `src/core/scheduler.py`:**
+If your `.env` has `SCHEDULE_TIMES=12:00,18:00`, also modify:
+
+**`src/core/scheduler.py`:**
 ```python
-# Add to imports
+# Add import
 from pathlib import Path
 
-# Update __init__ (add logs_dir parameter)
+# Update __init__ to accept logs_dir
 def __init__(self, frequency_hours: float, timezone: str, schedule_times_timezone: str = 'Europe/Athens', 
              schedule_times: List[str] = None, logs_dir: Path = None):
     # ... existing code ...
     self.logs_dir = logs_dir or Path('/app/logs')  # ADD THIS LINE
-    # ... rest stays same ...
 
 # Add method after register_alert()
 def _write_health_status(self, logs_dir: Path, timezone: ZoneInfo) -> None:
-    """Write health status for Docker healthcheck."""
     health_file = logs_dir / 'health_status.txt'
     timestamp = datetime.now(tz=timezone).isoformat()
     try:
         health_file.write_text(f"OK {timestamp}\n")
-        logger.debug(f"Health status written: {timestamp}")
     except Exception as e:
         logger.error(f"Failed to write health status: {e}")
 
-# Update _run_all_alerts() - add at end
-def _run_all_alerts(self) -> None:
-    # ... existing code ...
-    self._write_health_status(self.logs_dir, self.timezone)  # ADD AT END
+# Add at end of _run_all_alerts()
+self._write_health_status(self.logs_dir, self.timezone)
 ```
 
-**In `src/main.py`:**
+**`src/main.py`:**
 ```python
-# Update scheduler creation (around line 207)
+# Add logs_dir parameter when creating scheduler
 scheduler = AlertScheduler(
     frequency_hours=config.schedule_frequency_hours,
     timezone=config.timezone,
@@ -103,60 +241,82 @@ scheduler = AlertScheduler(
 )
 ```
 
----
+## Remove Project from Monitoring
 
-### Deploy Checklist
+**Option 1: Remove healthcheck (recommended)**
 ```bash
-# 1. Backup
-cp src/core/base_alert.py src/core/base_alert.py.backup
-cp Dockerfile Dockerfile.backup
-
-# 2. Make changes above
-
-# 3. Deploy
+# Edit Dockerfile - delete HEALTHCHECK line
+vim Dockerfile
 docker compose build --no-cache && docker compose up -d
-
-# 4. Verify (wait for next scheduled run first)
-docker exec <container-name> cat /app/logs/health_status.txt
-# Should show: OK <timestamp>
-
-# 5. Check health (wait 30 min after health file created)
-docker compose ps
-# Should show: (healthy)
 ```
 
----
+**Option 2: Stop container**
+```bash
+docker compose down
+```
 
-### Quick Reference
-
-**Backward compatible?** Yes - all changes safe to deploy  
-**Rollback:** Restore `.backup` files, rebuild, restart (5 min)  
-**Applies to:** All projects with `src/core/base_alert.py`  
-**Extra steps for:** Projects with `SCHEDULE_TIMES` in `.env`  
-
-**What it does:**
-- Detects app-level failures (DB errors, exceptions)
-- Writes health status after each run
-- Docker monitors health file freshness + content
-- Email alerts on health changes
-
-**Timeline to healthy:**
-- Frequency-based: ~1 hour after deploy
-- Time-based: Next scheduled run time
-
----
-
-### Troubleshooting
+## Troubleshooting
 ```bash
 # Health file not created
-docker exec <container> grep "_write_health_status" /app/src/core/base_alert.py
-# If empty: rebuild with --no-cache
-
-# Container unhealthy
 docker exec <container> cat /app/logs/health_status.txt
-# Check for "ERROR" - if present, fix underlying issue
-# Check timestamp - if old, alerts not running
 
 # Test healthcheck manually
 docker exec <container> sh -c 'test -f /app/logs/health_status.txt && grep -q "^OK" /app/logs/health_status.txt && echo "PASS" || echo "FAIL"'
+
+# Check monitor logs
+tail -f /srv/repos/alerts/_docker_health_monitor/logs/monitor.log
+
+# Check if health monitoring code applied
+docker exec <container> grep "_write_health_status" /app/src/core/base_alert.py
 ```
+
+## What Gets Detected
+
+**Application Failures:**
+- Database connection errors
+- API authentication failures
+- Query execution errors
+- Unhandled exceptions
+
+**Container Failures:**
+- Process crashes
+- Container stops
+- Healthcheck failures
+
+## Retry Behavior
+
+**Simple mode (default):**
+```
+12:00 - Unhealthy detected
+12:10 - Check again → Still unhealthy → Send alert
+Total: 10 minutes to alert
+```
+
+**With backoff (HEALTH_USE_BACKOFF=true):**
+```
+12:00 - Unhealthy detected
+12:05 - Check again (attempt 1) → Still unhealthy
+12:15 - Check again (attempt 2, 5*2=10min) → Still unhealthy
+12:35 - Check again (attempt 3, 10*2=20min) → Send alert
+Total: 35 minutes, but catches persistent issues
+```
+
+## Scaling
+
+- ✓ 5 containers: Works great
+- ✓ 10-20 containers: Parallel checks keep it fast
+- ✓ 50+ containers: No slowdown, designed for scale
+
+## Backward Compatibility
+
+✓ All changes are backward compatible  
+✓ Existing functionality preserved  
+✓ Health monitoring adds capability without breaking anything  
+✓ 5-minute rollback if needed
+
+## Support
+
+- **Logs:** `tail -f /srv/repos/alerts/_docker_health_monitor/logs/monitor.log`
+- **Status:** `sudo systemctl status docker-health-monitor`
+- **Health:** `docker ps --format "table {{.Names}}\t{{.Status}}"`
+- **Full Guide:** See [README_LONG.md](README_LONG.md)
