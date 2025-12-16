@@ -2,6 +2,474 @@
 
 A robust, production-ready Docker container health monitoring system that tracks containers across multiple projects and sends intelligent email alerts when issues are detected.
 
+## Quickstart Guide
+
+Get your entire monitoring system up and running in 15 minutes.
+
+### Prerequisites Check
+
+```bash
+# Verify you have the requirements
+python3 --version  # Should be 3.7+
+docker --version   # Should be 19.03+
+docker ps          # Should list running containers
+
+# Verify you have SMTP credentials ready
+# - SMTP server hostname
+# - SMTP port (usually 587 or 465)
+# - Username/email
+# - Password (or app password for Gmail)
+```
+
+### Step 1: Set Up the Monitor (5 minutes)
+
+**On your Ubuntu server:**
+
+```bash
+# 1. Create monitoring directory
+sudo mkdir -p /srv/repos/_docker_monitoring/logs
+cd /srv/repos/_docker_monitoring
+
+# 2. Download the monitor script
+# (Upload docker_health_monitor.py to this directory via SCP, Git, or copy-paste)
+wget https://your-repo/docker_health_monitor.py
+# OR
+scp docker_health_monitor.py user@server:/srv/repos/_docker_monitoring/
+
+# 3. Make it executable
+chmod +x docker_health_monitor.py
+
+# 4. Install Python dependencies
+pip3 install docker python-decouple
+
+# 5. Create .env configuration
+cat > .env << 'EOF'
+# SMTP Configuration
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-app-password
+
+# Alert Recipients
+HEALTH_CHECK_ALERT_EMAILS=admin@example.com,ops@example.com
+
+# Server Identification
+SERVER_NAME=Production Server
+
+# Monitoring Intervals (adjust as needed)
+HEALTH_CHECK_INTERVAL_SEC=30
+WAIT_AND_CHECK_AGAIN_MIN=15
+HEALTH_CHECK_LOG_LINES=50
+EOF
+
+# 6. Edit .env with your actual credentials
+vim .env
+# Press 'i' to edit, update values, then ESC + :wq to save
+
+# 7. Test the configuration
+python3 -c "from decouple import config; print('SMTP:', config('SMTP_HOST')); print('Emails:', config('HEALTH_CHECK_ALERT_EMAILS'))"
+```
+
+### Step 2: Add Healthchecks to Your Projects (5 minutes per project)
+
+For **each** of your Docker projects (e.g., `passage_plan`, `vessel_certificates`, `hot_works_alerts`):
+
+```bash
+# Navigate to project directory
+cd /srv/repos/passage_plan  # Or your project path
+
+# Create scripts directory if it doesn't exist
+mkdir -p scripts
+
+# Create healthcheck.py
+cat > scripts/healthcheck.py << 'EOFHC'
+#!/usr/bin/env python3
+"""
+Healthcheck script for Docker containers with flexible scheduling.
+Supports both SCHEDULE_FREQUENCY_HOURS and SCHEDULE_TIMES modes.
+"""
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def main():
+    """Main healthcheck logic."""
+    health_file = Path("/app/logs/health_status.txt")
+    
+    # Check if health file exists
+    if not health_file.exists():
+        print("Health status file not found", file=sys.stderr)
+        sys.exit(1)
+    
+    # Read health status
+    try:
+        content = health_file.read_text().strip()
+        if not content.startswith("OK"):
+            print(f"Health status is not OK: {content}", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"Cannot read health status: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Calculate maximum age based on schedule mode
+    max_age_minutes = calculate_max_age()
+    
+    # Check file modification time
+    file_age_seconds = datetime.now().timestamp() - health_file.stat().st_mtime
+    file_age_minutes = file_age_seconds / 60
+    
+    if file_age_minutes > max_age_minutes:
+        print(
+            f"Health status file is too old: {file_age_minutes:.1f} minutes "
+            f"(max: {max_age_minutes:.1f} minutes)",
+            file=sys.stderr
+        )
+        sys.exit(1)
+    
+    # All checks passed
+    print(f"Healthy (file age: {file_age_minutes:.1f}/{max_age_minutes:.1f} minutes)")
+    sys.exit(0)
+
+
+def calculate_max_age() -> float:
+    """Calculate maximum allowed age for health_status.txt based on schedule mode."""
+    freq_hours = os.getenv('SCHEDULE_FREQUENCY_HOURS', '').strip()
+    schedule_times = os.getenv('SCHEDULE_TIMES', '').strip()
+    
+    # Mode 1: Frequency-based (e.g., every 2 hours)
+    if freq_hours:
+        try:
+            hours = float(freq_hours)
+            return hours * 60 + 10  # Allow schedule interval + 10 minute buffer
+        except (ValueError, TypeError):
+            print(f"Invalid SCHEDULE_FREQUENCY_HOURS: {freq_hours}", file=sys.stderr)
+            return 70  # Default fallback: 1 hour + 10 min buffer
+    
+    # Mode 2: Specific times (e.g., 12:00,18:00)
+    elif schedule_times:
+        try:
+            return calculate_max_age_from_times(schedule_times)
+        except Exception as e:
+            print(f"Error calculating age from SCHEDULE_TIMES: {e}", file=sys.stderr)
+            return 70
+    
+    # Mode 3: No schedule defined (default to hourly + buffer)
+    else:
+        print("Warning: Neither SCHEDULE_FREQUENCY_HOURS nor SCHEDULE_TIMES set", file=sys.stderr)
+        return 70
+
+
+def calculate_max_age_from_times(schedule_times: str) -> float:
+    """Calculate maximum age based on SCHEDULE_TIMES."""
+    now = datetime.now()
+    time_list = [t.strip() for t in schedule_times.split(',')]
+    scheduled_datetimes = []
+    
+    for time_str in time_list:
+        try:
+            hour, minute = map(int, time_str.split(':'))
+            scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            scheduled_datetimes.append(scheduled_today)
+            scheduled_yesterday = scheduled_today - timedelta(days=1)
+            scheduled_datetimes.append(scheduled_yesterday)
+        except (ValueError, IndexError) as e:
+            print(f"Invalid time format '{time_str}': {e}", file=sys.stderr)
+            continue
+    
+    if not scheduled_datetimes:
+        print("No valid times found in SCHEDULE_TIMES", file=sys.stderr)
+        return 70
+    
+    past_times = [dt for dt in scheduled_datetimes if dt <= now]
+    if not past_times:
+        past_times = sorted(scheduled_datetimes)
+    
+    most_recent = max(past_times)
+    minutes_since = (now - most_recent).total_seconds() / 60
+    return minutes_since + 10  # Add 10 minute buffer
+
+
+if __name__ == "__main__":
+    main()
+EOFHC
+
+# Make it executable
+chmod +x scripts/healthcheck.py
+```
+
+### Step 3: Update Dockerfiles (2 minutes per project)
+
+For each project, add healthcheck to your Dockerfile:
+
+```bash
+# Edit your Dockerfile
+vim Dockerfile
+```
+
+Add these lines **after** your `COPY` commands but **before** `CMD`:
+
+```dockerfile
+# Ensure scripts are copied (if not already)
+COPY scripts/ ./scripts/
+
+# Make healthcheck executable
+RUN chmod +x /app/scripts/*.py
+
+# Add healthcheck - choose interval based on your schedule
+# For SCHEDULE_TIMES (e.g., 12:00,18:00):
+HEALTHCHECK --interval=5m --timeout=10s --start-period=2m --retries=2 \
+  CMD python3 /app/scripts/healthcheck.py
+
+# For SCHEDULE_FREQUENCY_HOURS=1 (hourly):
+# HEALTHCHECK --interval=2m --timeout=10s --start-period=2m --retries=2 \
+#   CMD python3 /app/scripts/healthcheck.py
+
+# For SCHEDULE_FREQUENCY_HOURS=0.25 (every 15 min):
+# HEALTHCHECK --interval=1m --timeout=10s --start-period=1m --retries=3 \
+#   CMD python3 /app/scripts/healthcheck.py
+```
+
+**Choose the right interval:**
+- If using `SCHEDULE_TIMES=12:00,18:00` → `--interval=5m`
+- If using `SCHEDULE_FREQUENCY_HOURS=1` → `--interval=2m`
+- If using `SCHEDULE_FREQUENCY_HOURS=0.25` → `--interval=1m`
+
+### Step 4: Rebuild and Restart Containers (2 minutes per project)
+
+```bash
+# Still in project directory (e.g., /srv/repos/passage_plan)
+
+# Rebuild the image
+docker compose build
+
+# Restart containers
+docker compose up -d
+
+# Verify healthcheck is working
+docker ps
+# You should see "healthy" or "starting" in the STATUS column
+
+# Check detailed health status
+docker inspect <container-name> | grep -A 20 Health
+
+# Test healthcheck manually
+docker exec <container-name> python3 /app/scripts/healthcheck.py
+# Should output: "Healthy (file age: X/Y minutes)"
+```
+
+**Repeat Step 2-4 for each project:**
+- `/srv/repos/passage_plan`
+- `/srv/repos/vessel_certificates`
+- `/srv/repos/hot_works_alerts`
+- Any other projects
+
+### Step 5: Set Up Monitor as System Service (3 minutes)
+
+```bash
+# Create systemd service file
+sudo vim /etc/systemd/system/docker-health-monitor.service
+```
+
+Paste this content:
+
+```ini
+[Unit]
+Description=Multi-Project Docker Health Monitor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/srv/repos/_docker_monitoring
+ExecStart=/usr/bin/python3 /srv/repos/_docker_monitoring/docker_health_monitor.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**If running as non-root user:**
+```bash
+# Add your user to docker group
+sudo usermod -aG docker your-username
+
+# Then change User=root to User=your-username in service file
+```
+
+**Enable and start the service:**
+
+```bash
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Enable (start on boot)
+sudo systemctl enable docker-health-monitor
+
+# Start now
+sudo systemctl start docker-health-monitor
+
+# Check status
+sudo systemctl status docker-health-monitor
+# Should show: "active (running)"
+
+# View logs
+sudo journalctl -u docker-health-monitor -f
+# Press Ctrl+C to exit
+```
+
+### Step 6: Verify Everything Works (5 minutes)
+
+**1. Check monitor logs:**
+```bash
+tail -f /srv/repos/_docker_monitoring/logs/monitor.log
+```
+
+You should see:
+```
+======================================================================
+▶ MULTI-PROJECT DOCKER HEALTH MONITOR STARTED
+======================================================================
+```
+
+**2. Check container health statuses:**
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}"
+```
+
+All containers should show `healthy` or `starting` (will become healthy after `start_period`).
+
+**3. Test with intentional failure:**
+```bash
+# Pick one project to test
+cd /srv/repos/passage_plan
+
+# Break the container (e.g., wrong DB password in .env)
+vim .env
+# Change DB_PASS to something wrong, save
+
+# Restart container
+docker compose up -d
+
+# Watch it become unhealthy
+watch -n 5 'docker ps --format "table {{.Names}}\t{{.Status}}"'
+# After 2-5 minutes, should show "unhealthy"
+
+# Monitor logs - you should see Phase 2 activity after 15 minutes
+tail -f /srv/repos/_docker_monitoring/logs/monitor.log
+
+# You should receive an email alert after ~15 minutes!
+
+# Fix it
+vim .env
+# Restore correct DB_PASS
+docker compose up -d
+
+# Should become healthy again
+```
+
+### Step 7: Optional - Configure Project-Specific Routing
+
+If you want different teams to receive alerts for different projects:
+
+```bash
+# Edit monitor .env
+cd /srv/repos/_docker_monitoring
+vim .env
+```
+
+Add this line:
+```bash
+CONTAINER_ALERT_ROUTING=passage-plan:maritime-team@example.com;vessel-cert:compliance@example.com;hot-works:safety@example.com
+```
+
+Restart monitor:
+```bash
+sudo systemctl restart docker-health-monitor
+```
+
+### Quick Reference Commands
+
+```bash
+# Monitor status
+sudo systemctl status docker-health-monitor
+
+# Monitor logs (live)
+sudo journalctl -u docker-health-monitor -f
+tail -f /srv/repos/_docker_monitoring/logs/monitor.log
+
+# Container health statuses
+docker ps --format "table {{.Names}}\t{{.Status}}"
+
+# Check specific container healthcheck
+docker exec <container-name> python3 /app/scripts/healthcheck.py
+
+# Restart monitor
+sudo systemctl restart docker-health-monitor
+
+# Stop monitor
+sudo systemctl stop docker-health-monitor
+
+# View monitor configuration
+cat /srv/repos/_docker_monitoring/.env
+```
+
+### Troubleshooting Quick Fixes
+
+**Container shows "starting" forever:**
+```bash
+# Increase start_period in Dockerfile
+HEALTHCHECK --start-period=5m ...
+docker compose build && docker compose up -d
+```
+
+**Monitor not starting:**
+```bash
+# Check configuration
+python3 -c "from decouple import config; print(config('SMTP_HOST'))"
+
+# Check Docker permissions
+docker ps
+
+# Check service logs
+sudo journalctl -u docker-health-monitor -n 50
+```
+
+**No emails arriving:**
+```bash
+# Test SMTP
+cd /srv/repos/_docker_monitoring
+python3 << 'EOF'
+import smtplib
+from decouple import config
+
+server = smtplib.SMTP(config('SMTP_HOST'), int(config('SMTP_PORT', 587)))
+server.starttls()
+server.login(config('SMTP_USER'), config('SMTP_PASS'))
+print('✓ SMTP works')
+server.quit()
+EOF
+```
+
+### Success Checklist
+
+- [ ] Monitor service running: `systemctl status docker-health-monitor`
+- [ ] All containers show "healthy": `docker ps`
+- [ ] Monitor logs show activity: `tail -f logs/monitor.log`
+- [ ] Test email received (after breaking a container)
+- [ ] All projects have healthcheck.py
+- [ ] All Dockerfiles have HEALTHCHECK line
+- [ ] .env configured with correct SMTP settings
+
+** Your monitoring system is now active and will alert you of any container issues.**
+
+---
+
 ## Overview
 
 This monitor watches all Docker containers with healthchecks across multiple docker-compose projects, implements a two-phase verification pattern to avoid false positives, and sends contextual email alerts with actionable troubleshooting steps.

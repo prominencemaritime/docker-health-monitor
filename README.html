@@ -367,6 +367,412 @@ code {
   </script>
 <h1 id="multi-project-docker-health-monitor">Multi-Project Docker Health Monitor</h1>
 <p>A robust, production-ready Docker container health monitoring system that tracks containers across multiple projects and sends intelligent email alerts when issues are detected.</p>
+<h2 id="quickstart-guide">Quickstart Guide</h2>
+<p>Get your entire monitoring system up and running in 15 minutes.</p>
+<h3 id="prerequisites-check">Prerequisites Check</h3>
+<pre class="hljs"><code><div><span class="hljs-comment"># Verify you have the requirements</span>
+python3 --version  <span class="hljs-comment"># Should be 3.7+</span>
+docker --version   <span class="hljs-comment"># Should be 19.03+</span>
+docker ps          <span class="hljs-comment"># Should list running containers</span>
+
+<span class="hljs-comment"># Verify you have SMTP credentials ready</span>
+<span class="hljs-comment"># - SMTP server hostname</span>
+<span class="hljs-comment"># - SMTP port (usually 587 or 465)</span>
+<span class="hljs-comment"># - Username/email</span>
+<span class="hljs-comment"># - Password (or app password for Gmail)</span>
+</div></code></pre>
+<h3 id="step-1-set-up-the-monitor-5-minutes">Step 1: Set Up the Monitor (5 minutes)</h3>
+<p><strong>On your Ubuntu server:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># 1. Create monitoring directory</span>
+sudo mkdir -p /srv/repos/_docker_monitoring/logs
+<span class="hljs-built_in">cd</span> /srv/repos/_docker_monitoring
+
+<span class="hljs-comment"># 2. Download the monitor script</span>
+<span class="hljs-comment"># (Upload docker_health_monitor.py to this directory via SCP, Git, or copy-paste)</span>
+wget https://your-repo/docker_health_monitor.py
+<span class="hljs-comment"># OR</span>
+scp docker_health_monitor.py user@server:/srv/repos/_docker_monitoring/
+
+<span class="hljs-comment"># 3. Make it executable</span>
+chmod +x docker_health_monitor.py
+
+<span class="hljs-comment"># 4. Install Python dependencies</span>
+pip3 install docker python-decouple
+
+<span class="hljs-comment"># 5. Create .env configuration</span>
+cat &gt; .env &lt;&lt; <span class="hljs-string">'EOF'</span>
+<span class="hljs-comment"># SMTP Configuration</span>
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASS=your-app-password
+
+<span class="hljs-comment"># Alert Recipients</span>
+HEALTH_CHECK_ALERT_EMAILS=admin@example.com,ops@example.com
+
+<span class="hljs-comment"># Server Identification</span>
+SERVER_NAME=Production Server
+
+<span class="hljs-comment"># Monitoring Intervals (adjust as needed)</span>
+HEALTH_CHECK_INTERVAL_SEC=30
+WAIT_AND_CHECK_AGAIN_MIN=15
+HEALTH_CHECK_LOG_LINES=50
+EOF
+
+<span class="hljs-comment"># 6. Edit .env with your actual credentials</span>
+vim .env
+<span class="hljs-comment"># Press 'i' to edit, update values, then ESC + :wq to save</span>
+
+<span class="hljs-comment"># 7. Test the configuration</span>
+python3 -c <span class="hljs-string">"from decouple import config; print('SMTP:', config('SMTP_HOST')); print('Emails:', config('HEALTH_CHECK_ALERT_EMAILS'))"</span>
+</div></code></pre>
+<h3 id="step-2-add-healthchecks-to-your-projects-5-minutes-per-project">Step 2: Add Healthchecks to Your Projects (5 minutes per project)</h3>
+<p>For <strong>each</strong> of your Docker projects (e.g., <code>passage_plan</code>, <code>vessel_certificates</code>, <code>hot_works_alerts</code>):</p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Navigate to project directory</span>
+<span class="hljs-built_in">cd</span> /srv/repos/passage_plan  <span class="hljs-comment"># Or your project path</span>
+
+<span class="hljs-comment"># Create scripts directory if it doesn't exist</span>
+mkdir -p scripts
+
+<span class="hljs-comment"># Create healthcheck.py</span>
+cat &gt; scripts/healthcheck.py &lt;&lt; <span class="hljs-string">'EOFHC'</span>
+<span class="hljs-comment">#!/usr/bin/env python3</span>
+<span class="hljs-string">""</span><span class="hljs-string">"
+Healthcheck script for Docker containers with flexible scheduling.
+Supports both SCHEDULE_FREQUENCY_HOURS and SCHEDULE_TIMES modes.
+"</span><span class="hljs-string">""</span>
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def main():
+    <span class="hljs-string">""</span><span class="hljs-string">"Main healthcheck logic."</span><span class="hljs-string">""</span>
+    health_file = Path(<span class="hljs-string">"/app/logs/health_status.txt"</span>)
+    
+    <span class="hljs-comment"># Check if health file exists</span>
+    <span class="hljs-keyword">if</span> not health_file.exists():
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">"Health status file not found"</span>, file=sys.stderr)
+        sys.exit(1)
+    
+    <span class="hljs-comment"># Read health status</span>
+    try:
+        content = health_file.read_text().strip()
+        <span class="hljs-keyword">if</span> not content.startswith(<span class="hljs-string">"OK"</span>):
+            <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Health status is not OK: {content}"</span>, file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Cannot read health status: {e}"</span>, file=sys.stderr)
+        sys.exit(1)
+    
+    <span class="hljs-comment"># Calculate maximum age based on schedule mode</span>
+    max_age_minutes = calculate_max_age()
+    
+    <span class="hljs-comment"># Check file modification time</span>
+    file_age_seconds = datetime.now().timestamp() - health_file.stat().st_mtime
+    file_age_minutes = file_age_seconds / 60
+    
+    <span class="hljs-keyword">if</span> file_age_minutes &gt; max_age_minutes:
+        <span class="hljs-built_in">print</span>(
+            f<span class="hljs-string">"Health status file is too old: {file_age_minutes:.1f} minutes "</span>
+            f<span class="hljs-string">"(max: {max_age_minutes:.1f} minutes)"</span>,
+            file=sys.stderr
+        )
+        sys.exit(1)
+    
+    <span class="hljs-comment"># All checks passed</span>
+    <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Healthy (file age: {file_age_minutes:.1f}/{max_age_minutes:.1f} minutes)"</span>)
+    sys.exit(0)
+
+
+def calculate_max_age() -&gt; <span class="hljs-built_in">float</span>:
+    <span class="hljs-string">""</span><span class="hljs-string">"Calculate maximum allowed age for health_status.txt based on schedule mode."</span><span class="hljs-string">""</span>
+    freq_hours = os.getenv(<span class="hljs-string">'SCHEDULE_FREQUENCY_HOURS'</span>, <span class="hljs-string">''</span>).strip()
+    schedule_times = os.getenv(<span class="hljs-string">'SCHEDULE_TIMES'</span>, <span class="hljs-string">''</span>).strip()
+    
+    <span class="hljs-comment"># Mode 1: Frequency-based (e.g., every 2 hours)</span>
+    <span class="hljs-keyword">if</span> freq_hours:
+        try:
+            hours = <span class="hljs-built_in">float</span>(freq_hours)
+            <span class="hljs-built_in">return</span> hours * 60 + 10  <span class="hljs-comment"># Allow schedule interval + 10 minute buffer</span>
+        except (ValueError, TypeError):
+            <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Invalid SCHEDULE_FREQUENCY_HOURS: {freq_hours}"</span>, file=sys.stderr)
+            <span class="hljs-built_in">return</span> 70  <span class="hljs-comment"># Default fallback: 1 hour + 10 min buffer</span>
+    
+    <span class="hljs-comment"># Mode 2: Specific times (e.g., 12:00,18:00)</span>
+    <span class="hljs-keyword">elif</span> schedule_times:
+        try:
+            <span class="hljs-built_in">return</span> calculate_max_age_from_times(schedule_times)
+        except Exception as e:
+            <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Error calculating age from SCHEDULE_TIMES: {e}"</span>, file=sys.stderr)
+            <span class="hljs-built_in">return</span> 70
+    
+    <span class="hljs-comment"># Mode 3: No schedule defined (default to hourly + buffer)</span>
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">"Warning: Neither SCHEDULE_FREQUENCY_HOURS nor SCHEDULE_TIMES set"</span>, file=sys.stderr)
+        <span class="hljs-built_in">return</span> 70
+
+
+def calculate_max_age_from_times(schedule_times: str) -&gt; <span class="hljs-built_in">float</span>:
+    <span class="hljs-string">""</span><span class="hljs-string">"Calculate maximum age based on SCHEDULE_TIMES."</span><span class="hljs-string">""</span>
+    now = datetime.now()
+    time_list = [t.strip() <span class="hljs-keyword">for</span> t <span class="hljs-keyword">in</span> schedule_times.split(<span class="hljs-string">','</span>)]
+    scheduled_datetimes = []
+    
+    <span class="hljs-keyword">for</span> time_str <span class="hljs-keyword">in</span> time_list:
+        try:
+            hour, minute = map(int, time_str.split(<span class="hljs-string">':'</span>))
+            scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            scheduled_datetimes.append(scheduled_today)
+            scheduled_yesterday = scheduled_today - timedelta(days=1)
+            scheduled_datetimes.append(scheduled_yesterday)
+        except (ValueError, IndexError) as e:
+            <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Invalid time format '{time_str}': {e}"</span>, file=sys.stderr)
+            <span class="hljs-built_in">continue</span>
+    
+    <span class="hljs-keyword">if</span> not scheduled_datetimes:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">"No valid times found in SCHEDULE_TIMES"</span>, file=sys.stderr)
+        <span class="hljs-built_in">return</span> 70
+    
+    past_times = [dt <span class="hljs-keyword">for</span> dt <span class="hljs-keyword">in</span> scheduled_datetimes <span class="hljs-keyword">if</span> dt &lt;= now]
+    <span class="hljs-keyword">if</span> not past_times:
+        past_times = sorted(scheduled_datetimes)
+    
+    most_recent = max(past_times)
+    minutes_since = (now - most_recent).total_seconds() / 60
+    <span class="hljs-built_in">return</span> minutes_since + 10  <span class="hljs-comment"># Add 10 minute buffer</span>
+
+
+<span class="hljs-keyword">if</span> __name__ == <span class="hljs-string">"__main__"</span>:
+    main()
+EOFHC
+
+<span class="hljs-comment"># Make it executable</span>
+chmod +x scripts/healthcheck.py
+</div></code></pre>
+<h3 id="step-3-update-dockerfiles-2-minutes-per-project">Step 3: Update Dockerfiles (2 minutes per project)</h3>
+<p>For each project, add healthcheck to your Dockerfile:</p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Edit your Dockerfile</span>
+vim Dockerfile
+</div></code></pre>
+<p>Add these lines <strong>after</strong> your <code>COPY</code> commands but <strong>before</strong> <code>CMD</code>:</p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Ensure scripts are copied (if not already)</span>
+<span class="hljs-keyword">COPY</span><span class="bash"> scripts/ ./scripts/</span>
+
+<span class="hljs-comment"># Make healthcheck executable</span>
+<span class="hljs-keyword">RUN</span><span class="bash"> chmod +x /app/scripts/*.py</span>
+
+<span class="hljs-comment"># Add healthcheck - choose interval based on your schedule</span>
+<span class="hljs-comment"># For SCHEDULE_TIMES (e.g., 12:00,18:00):</span>
+<span class="hljs-keyword">HEALTHCHECK</span><span class="bash"> --interval=5m --timeout=10s --start-period=2m --retries=2 \
+  CMD python3 /app/scripts/healthcheck.py</span>
+
+<span class="hljs-comment"># For SCHEDULE_FREQUENCY_HOURS=1 (hourly):</span>
+<span class="hljs-comment"># HEALTHCHECK --interval=2m --timeout=10s --start-period=2m --retries=2 \</span>
+<span class="hljs-comment">#   CMD python3 /app/scripts/healthcheck.py</span>
+
+<span class="hljs-comment"># For SCHEDULE_FREQUENCY_HOURS=0.25 (every 15 min):</span>
+<span class="hljs-comment"># HEALTHCHECK --interval=1m --timeout=10s --start-period=1m --retries=3 \</span>
+<span class="hljs-comment">#   CMD python3 /app/scripts/healthcheck.py</span>
+</div></code></pre>
+<p><strong>Choose the right interval:</strong></p>
+<ul>
+<li>If using <code>SCHEDULE_TIMES=12:00,18:00</code> → <code>--interval=5m</code></li>
+<li>If using <code>SCHEDULE_FREQUENCY_HOURS=1</code> → <code>--interval=2m</code></li>
+<li>If using <code>SCHEDULE_FREQUENCY_HOURS=0.25</code> → <code>--interval=1m</code></li>
+</ul>
+<h3 id="step-4-rebuild-and-restart-containers-2-minutes-per-project">Step 4: Rebuild and Restart Containers (2 minutes per project)</h3>
+<pre class="hljs"><code><div><span class="hljs-comment"># Still in project directory (e.g., /srv/repos/passage_plan)</span>
+
+<span class="hljs-comment"># Rebuild the image</span>
+docker compose build
+
+<span class="hljs-comment"># Restart containers</span>
+docker compose up -d
+
+<span class="hljs-comment"># Verify healthcheck is working</span>
+docker ps
+<span class="hljs-comment"># You should see "healthy" or "starting" in the STATUS column</span>
+
+<span class="hljs-comment"># Check detailed health status</span>
+docker inspect &lt;container-name&gt; | grep -A 20 Health
+
+<span class="hljs-comment"># Test healthcheck manually</span>
+docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 /app/scripts/healthcheck.py
+<span class="hljs-comment"># Should output: "Healthy (file age: X/Y minutes)"</span>
+</div></code></pre>
+<p><strong>Repeat Step 2-4 for each project:</strong></p>
+<ul>
+<li><code>/srv/repos/passage_plan</code></li>
+<li><code>/srv/repos/vessel_certificates</code></li>
+<li><code>/srv/repos/hot_works_alerts</code></li>
+<li>Any other projects</li>
+</ul>
+<h3 id="step-5-set-up-monitor-as-system-service-3-minutes">Step 5: Set Up Monitor as System Service (3 minutes)</h3>
+<pre class="hljs"><code><div><span class="hljs-comment"># Create systemd service file</span>
+sudo vim /etc/systemd/system/docker-health-monitor.service
+</div></code></pre>
+<p>Paste this content:</p>
+<pre class="hljs"><code><div><span class="hljs-section">[Unit]</span>
+<span class="hljs-attr">Description</span>=Multi-Project Docker Health Monitor
+<span class="hljs-attr">After</span>=docker.service
+<span class="hljs-attr">Requires</span>=docker.service
+
+<span class="hljs-section">[Service]</span>
+<span class="hljs-attr">Type</span>=simple
+<span class="hljs-attr">User</span>=root
+<span class="hljs-attr">WorkingDirectory</span>=/srv/repos/_docker_monitoring
+<span class="hljs-attr">ExecStart</span>=/usr/bin/python3 /srv/repos/_docker_monitoring/docker_health_monitor.py
+<span class="hljs-attr">Restart</span>=always
+<span class="hljs-attr">RestartSec</span>=<span class="hljs-number">10</span>
+<span class="hljs-attr">StandardOutput</span>=journal
+<span class="hljs-attr">StandardError</span>=journal
+
+<span class="hljs-section">[Install]</span>
+<span class="hljs-attr">WantedBy</span>=multi-user.target
+</div></code></pre>
+<p><strong>If running as non-root user:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Add your user to docker group</span>
+sudo usermod -aG docker your-username
+
+<span class="hljs-comment"># Then change User=root to User=your-username in service file</span>
+</div></code></pre>
+<p><strong>Enable and start the service:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Reload systemd</span>
+sudo systemctl daemon-reload
+
+<span class="hljs-comment"># Enable (start on boot)</span>
+sudo systemctl <span class="hljs-built_in">enable</span> docker-health-monitor
+
+<span class="hljs-comment"># Start now</span>
+sudo systemctl start docker-health-monitor
+
+<span class="hljs-comment"># Check status</span>
+sudo systemctl status docker-health-monitor
+<span class="hljs-comment"># Should show: "active (running)"</span>
+
+<span class="hljs-comment"># View logs</span>
+sudo journalctl -u docker-health-monitor -f
+<span class="hljs-comment"># Press Ctrl+C to exit</span>
+</div></code></pre>
+<h3 id="step-6-verify-everything-works-5-minutes">Step 6: Verify Everything Works (5 minutes)</h3>
+<p><strong>1. Check monitor logs:</strong></p>
+<pre class="hljs"><code><div>tail -f /srv/repos/_docker_monitoring/logs/monitor.log
+</div></code></pre>
+<p>You should see:</p>
+<pre class="hljs"><code><div>======================================================================
+▶ MULTI-PROJECT DOCKER HEALTH MONITOR STARTED
+======================================================================
+</div></code></pre>
+<p><strong>2. Check container health statuses:</strong></p>
+<pre class="hljs"><code><div>docker ps --format <span class="hljs-string">"table {{.Names}}\t{{.Status}}"</span>
+</div></code></pre>
+<p>All containers should show <code>healthy</code> or <code>starting</code> (will become healthy after <code>start_period</code>).</p>
+<p><strong>3. Test with intentional failure:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Pick one project to test</span>
+<span class="hljs-built_in">cd</span> /srv/repos/passage_plan
+
+<span class="hljs-comment"># Break the container (e.g., wrong DB password in .env)</span>
+vim .env
+<span class="hljs-comment"># Change DB_PASS to something wrong, save</span>
+
+<span class="hljs-comment"># Restart container</span>
+docker compose up -d
+
+<span class="hljs-comment"># Watch it become unhealthy</span>
+watch -n 5 <span class="hljs-string">'docker ps --format "table {{.Names}}\t{{.Status}}"'</span>
+<span class="hljs-comment"># After 2-5 minutes, should show "unhealthy"</span>
+
+<span class="hljs-comment"># Monitor logs - you should see Phase 2 activity after 15 minutes</span>
+tail -f /srv/repos/_docker_monitoring/logs/monitor.log
+
+<span class="hljs-comment"># You should receive an email alert after ~15 minutes!</span>
+
+<span class="hljs-comment"># Fix it</span>
+vim .env
+<span class="hljs-comment"># Restore correct DB_PASS</span>
+docker compose up -d
+
+<span class="hljs-comment"># Should become healthy again</span>
+</div></code></pre>
+<h3 id="step-7-optional---configure-project-specific-routing">Step 7: Optional - Configure Project-Specific Routing</h3>
+<p>If you want different teams to receive alerts for different projects:</p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Edit monitor .env</span>
+<span class="hljs-built_in">cd</span> /srv/repos/_docker_monitoring
+vim .env
+</div></code></pre>
+<p>Add this line:</p>
+<pre class="hljs"><code><div>CONTAINER_ALERT_ROUTING=passage-plan:maritime-team@example.com;vessel-cert:compliance@example.com;hot-works:safety@example.com
+</div></code></pre>
+<p>Restart monitor:</p>
+<pre class="hljs"><code><div>sudo systemctl restart docker-health-monitor
+</div></code></pre>
+<h3 id="quick-reference-commands">Quick Reference Commands</h3>
+<pre class="hljs"><code><div><span class="hljs-comment"># Monitor status</span>
+sudo systemctl status docker-health-monitor
+
+<span class="hljs-comment"># Monitor logs (live)</span>
+sudo journalctl -u docker-health-monitor -f
+tail -f /srv/repos/_docker_monitoring/logs/monitor.log
+
+<span class="hljs-comment"># Container health statuses</span>
+docker ps --format <span class="hljs-string">"table {{.Names}}\t{{.Status}}"</span>
+
+<span class="hljs-comment"># Check specific container healthcheck</span>
+docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 /app/scripts/healthcheck.py
+
+<span class="hljs-comment"># Restart monitor</span>
+sudo systemctl restart docker-health-monitor
+
+<span class="hljs-comment"># Stop monitor</span>
+sudo systemctl stop docker-health-monitor
+
+<span class="hljs-comment"># View monitor configuration</span>
+cat /srv/repos/_docker_monitoring/.env
+</div></code></pre>
+<h3 id="troubleshooting-quick-fixes">Troubleshooting Quick Fixes</h3>
+<p><strong>Container shows &quot;starting&quot; forever:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Increase start_period in Dockerfile</span>
+HEALTHCHECK --start-period=5m ...
+docker compose build &amp;&amp; docker compose up -d
+</div></code></pre>
+<p><strong>Monitor not starting:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Check configuration</span>
+python3 -c <span class="hljs-string">"from decouple import config; print(config('SMTP_HOST'))"</span>
+
+<span class="hljs-comment"># Check Docker permissions</span>
+docker ps
+
+<span class="hljs-comment"># Check service logs</span>
+sudo journalctl -u docker-health-monitor -n 50
+</div></code></pre>
+<p><strong>No emails arriving:</strong></p>
+<pre class="hljs"><code><div><span class="hljs-comment"># Test SMTP</span>
+<span class="hljs-built_in">cd</span> /srv/repos/_docker_monitoring
+python3 &lt;&lt; <span class="hljs-string">'EOF'</span>
+import smtplib
+from decouple import config
+
+server = smtplib.SMTP(config(<span class="hljs-string">'SMTP_HOST'</span>), int(config(<span class="hljs-string">'SMTP_PORT'</span>, 587)))
+server.starttls()
+server.login(config(<span class="hljs-string">'SMTP_USER'</span>), config(<span class="hljs-string">'SMTP_PASS'</span>))
+<span class="hljs-built_in">print</span>(<span class="hljs-string">'✓ SMTP works'</span>)
+server.quit()
+EOF
+</div></code></pre>
+<h3 id="success-checklist">Success Checklist</h3>
+<ul>
+<li><input type="checkbox" id="checkbox0"><label for="checkbox0">Monitor service running: </label><code>systemctl status docker-health-monitor</code></li>
+<li><input type="checkbox" id="checkbox1"><label for="checkbox1">All containers show &quot;healthy&quot;: </label><code>docker ps</code></li>
+<li><input type="checkbox" id="checkbox2"><label for="checkbox2">Monitor logs show activity: </label><code>tail -f logs/monitor.log</code></li>
+<li><input type="checkbox" id="checkbox3"><label for="checkbox3">Test email received (after breaking a container)</label></li>
+<li><input type="checkbox" id="checkbox4"><label for="checkbox4">All projects have healthcheck.py</label></li>
+<li><input type="checkbox" id="checkbox5"><label for="checkbox5">All Dockerfiles have HEALTHCHECK line</label></li>
+<li><input type="checkbox" id="checkbox6"><label for="checkbox6">.env configured with correct SMTP settings</label></li>
+</ul>
+<p>** Your monitoring system is now active and will alert you of any container issues.**</p>
+<hr>
 <h2 id="overview">Overview</h2>
 <p>This monitor watches all Docker containers with healthchecks across multiple docker-compose projects, implements a two-phase verification pattern to avoid false positives, and sends contextual email alerts with actionable troubleshooting steps.</p>
 <p><strong>Key Features:</strong></p>
@@ -1353,16 +1759,16 @@ HEALTH_CHECK_INTERVAL_SEC=60
 </div></code></pre>
 <h3 id="production-deployment-checklist">Production Deployment Checklist</h3>
 <ul>
-<li><input type="checkbox" id="checkbox0"><label for="checkbox0">Test in staging environment first</label></li>
-<li><input type="checkbox" id="checkbox1"><label for="checkbox1">Start with longer retry delays (15-20 minutes)</label></li>
-<li><input type="checkbox" id="checkbox2"><label for="checkbox2">Monitor logs daily for first week</label></li>
-<li><input type="checkbox" id="checkbox3"><label for="checkbox3">Verify SMTP credentials work (test both ports if needed)</label></li>
-<li><input type="checkbox" id="checkbox4"><label for="checkbox4">Test with intentional container failure</label></li>
-<li><input type="checkbox" id="checkbox5"><label for="checkbox5">Set up systemd service for automatic restart (Ubuntu)</label></li>
-<li><input type="checkbox" id="checkbox6"><label for="checkbox6">Configure project-specific routing</label></li>
-<li><input type="checkbox" id="checkbox7"><label for="checkbox7">Add monitor email to allow-list</label></li>
-<li><input type="checkbox" id="checkbox8"><label for="checkbox8">Document alert response procedures</label></li>
-<li><input type="checkbox" id="checkbox9"><label for="checkbox9">Verify all containers have healthchecks</label></li>
+<li><input type="checkbox" id="checkbox7"><label for="checkbox7">Test in staging environment first</label></li>
+<li><input type="checkbox" id="checkbox8"><label for="checkbox8">Start with longer retry delays (15-20 minutes)</label></li>
+<li><input type="checkbox" id="checkbox9"><label for="checkbox9">Monitor logs daily for first week</label></li>
+<li><input type="checkbox" id="checkbox10"><label for="checkbox10">Verify SMTP credentials work (test both ports if needed)</label></li>
+<li><input type="checkbox" id="checkbox11"><label for="checkbox11">Test with intentional container failure</label></li>
+<li><input type="checkbox" id="checkbox12"><label for="checkbox12">Set up systemd service for automatic restart (Ubuntu)</label></li>
+<li><input type="checkbox" id="checkbox13"><label for="checkbox13">Configure project-specific routing</label></li>
+<li><input type="checkbox" id="checkbox14"><label for="checkbox14">Add monitor email to allow-list</label></li>
+<li><input type="checkbox" id="checkbox15"><label for="checkbox15">Document alert response procedures</label></li>
+<li><input type="checkbox" id="checkbox16"><label for="checkbox16">Verify all containers have healthchecks</label></li>
 </ul>
 <h2 id="graceful-shutdown">Graceful Shutdown</h2>
 <p>The monitor handles <code>SIGTERM</code> and <code>SIGINT</code> signals properly:</p>
