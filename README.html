@@ -440,108 +440,335 @@ cat &gt; scripts/healthcheck.py &lt;&lt; <span class="hljs-string">'EOFHC'</span
 <span class="hljs-string">""</span><span class="hljs-string">"
 Healthcheck script for Docker containers with flexible scheduling.
 Supports both SCHEDULE_FREQUENCY_HOURS and SCHEDULE_TIMES modes.
+
+This script checks if /app/logs/health_status.txt exists, contains "</span>OK<span class="hljs-string">",
+and has been updated recently enough based on the schedule configuration.
+
+Environment Variables:
+    SCHEDULE_FREQUENCY_HOURS: Run every N hours (e.g., "</span>2<span class="hljs-string">" for every 2 hours)
+    SCHEDULE_TIMES: Run at specific times (e.g., "</span>12:00,18:00<span class="hljs-string">")
+
+At least one must be set. If both are set, SCHEDULE_FREQUENCY_HOURS takes precedence.
+
+Exit Codes:
+    0: Healthy
+    1: Unhealthy
 "</span><span class="hljs-string">""</span>
 import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 def main():
-    <span class="hljs-string">""</span><span class="hljs-string">"Main healthcheck logic."</span><span class="hljs-string">""</span>
+    <span class="hljs-string">""</span><span class="hljs-string">"
+    Main healthcheck logic.
+
+    Validates the health_status.txt file by checking:
+    1. File exists
+    2. File contains valid structured data
+    3. Status is OK or ERROR is recent
+    4. Timestamp is recent enough based on schedule
+
+    Exit codes:
+        0: Healthy
+        1: Unhealthy
+    "</span><span class="hljs-string">""</span>
     health_file = Path(<span class="hljs-string">"/app/logs/health_status.txt"</span>)
-    
-    <span class="hljs-comment"># Check if health file exists</span>
-    <span class="hljs-keyword">if</span> not health_file.exists():
-        <span class="hljs-built_in">print</span>(<span class="hljs-string">"Health status file not found"</span>, file=sys.stderr)
-        sys.exit(1)
-    
-    <span class="hljs-comment"># Read health status</span>
+
+    <span class="hljs-comment"># Validate file structure first</span>
     try:
-        content = health_file.read_text().strip()
-        <span class="hljs-keyword">if</span> not content.startswith(<span class="hljs-string">"OK"</span>):
-            <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Health status is not OK: {content}"</span>, file=sys.stderr)
-            sys.exit(1)
+        validate_health_file_structure(health_file)
     except Exception as e:
-        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Cannot read health status: {e}"</span>, file=sys.stderr)
+        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Health file validation failed: {e}"</span>, file=sys.stderr)
         sys.exit(1)
-    
+
+    <span class="hljs-comment"># Read and parse health status</span>
+    try:
+        health_data = parse_health_file(health_file)
+    except Exception as e:
+        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Cannot parse health status: {e}"</span>, file=sys.stderr)
+        sys.exit(1)
+
+    <span class="hljs-comment"># Get the timezone to use for time calculations</span>
+    tz_name = get_effective_timezone()
+
     <span class="hljs-comment"># Calculate maximum age based on schedule mode</span>
     max_age_minutes = calculate_max_age()
-    
-    <span class="hljs-comment"># Check file modification time</span>
-    file_age_seconds = datetime.now().timestamp() - health_file.stat().st_mtime
-    file_age_minutes = file_age_seconds / 60
-    
-    <span class="hljs-keyword">if</span> file_age_minutes &gt; max_age_minutes:
-        <span class="hljs-built_in">print</span>(
-            f<span class="hljs-string">"Health status file is too old: {file_age_minutes:.1f} minutes "</span>
-            f<span class="hljs-string">"(max: {max_age_minutes:.1f} minutes)"</span>,
-            file=sys.stderr
-        )
+
+    <span class="hljs-comment"># Calculate file age using the parsed timestamp (timezone-aware)</span>
+    try:
+        now = datetime.now(tz=ZoneInfo(tz_name))
+        file_age_seconds = (now - health_data[<span class="hljs-string">'timestamp'</span>]).total_seconds()
+        file_age_minutes = file_age_seconds / 60
+    except Exception as e:
+        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Cannot calculate file age: {e}"</span>, file=sys.stderr)
         sys.exit(1)
-    
+
+    <span class="hljs-comment"># Check status and age</span>
+    <span class="hljs-keyword">if</span> health_data[<span class="hljs-string">'status'</span>] == <span class="hljs-string">"ERROR"</span>:
+        <span class="hljs-comment"># For ERROR status, check if it's a recent error</span>
+        <span class="hljs-keyword">if</span> file_age_minutes &gt; max_age_minutes:
+            <span class="hljs-built_in">print</span>(
+                f<span class="hljs-string">"Health status is ERROR and stale: {file_age_minutes:.1f} minutes old "</span>
+                f<span class="hljs-string">"(max: {max_age_minutes:.1f} minutes). "</span>
+                f<span class="hljs-string">"Error: {health_data.get('error_msg', 'No error message')}"</span>,
+                file=sys.stderr
+            )
+            sys.exit(1)
+        <span class="hljs-keyword">else</span>:
+            <span class="hljs-comment"># Recent error - still fail but with different message</span>
+            <span class="hljs-built_in">print</span>(
+                f<span class="hljs-string">"Health status is ERROR (recent): {health_data.get('error_msg', 'No error message')}"</span>,
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+    <span class="hljs-keyword">elif</span> health_data[<span class="hljs-string">'status'</span>] == <span class="hljs-string">"OK"</span>:
+        <span class="hljs-comment"># Check if OK status is recent enough</span>
+        <span class="hljs-keyword">if</span> file_age_minutes &gt; max_age_minutes:
+            <span class="hljs-built_in">print</span>(
+                f<span class="hljs-string">"Health status file is too old: {file_age_minutes:.1f} minutes "</span>
+                f<span class="hljs-string">"(max: {max_age_minutes:.1f} minutes)"</span>,
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Unknown health status: {health_data['status']}"</span>, file=sys.stderr)
+        sys.exit(1)
+
     <span class="hljs-comment"># All checks passed</span>
-    <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Healthy (file age: {file_age_minutes:.1f}/{max_age_minutes:.1f} minutes)"</span>)
+    <span class="hljs-built_in">print</span>(
+        f<span class="hljs-string">"Healthy (status: {health_data['status']}, "</span>
+        f<span class="hljs-string">"alert: {health_data.get('alert_type', 'unknown')}, "</span>
+        f<span class="hljs-string">"age: {file_age_minutes:.1f}/{max_age_minutes:.1f} minutes)"</span>
+    )
     sys.exit(0)
 
 
+def parse_health_file(health_file: Path) -&gt; dict:
+    <span class="hljs-string">""</span><span class="hljs-string">"
+    Parse the structured health status file.
+
+    Expected format:
+        Line 1: STATUS YYYY-MM-DDTHH:MM:SS.ffffff+HH:MM
+        Line 2: ALERT_TYPE: ClassName
+        Line 3: TIMEZONE: timezone_name
+        Line 4: ERROR_MSG: message (optional, only if ERROR)
+
+    Args:
+        health_file: Path to health_status.txt
+
+    Returns:
+        Dictionary with parsed health data:
+            - status: "</span>OK<span class="hljs-string">" or "</span>ERROR<span class="hljs-string">"
+            - timestamp: timezone-aware datetime object
+            - alert_type: Alert class name
+            - timezone: Timezone name from file
+            - error_msg: Error message (only if status is ERROR)
+
+    Raises:
+        ValueError: If file format is invalid
+        Exception: If file cannot be read or parsed
+    "</span><span class="hljs-string">""</span>
+    content = health_file.read_text().strip()
+    lines = content.split(<span class="hljs-string">'\n'</span>)
+
+    <span class="hljs-keyword">if</span> len(lines) &lt; 3:
+        raise ValueError(f<span class="hljs-string">"Health file has insufficient lines: {len(lines)} (expected at least 3)"</span>)
+
+    <span class="hljs-comment"># Parse line 1: STATUS TIMESTAMP</span>
+    status_line = lines[0].strip()
+    parts = status_line.split(<span class="hljs-string">' '</span>, 1)
+
+    <span class="hljs-keyword">if</span> len(parts) != 2:
+        raise ValueError(f<span class="hljs-string">"Invalid status line format: '{status_line}'"</span>)
+
+    status = parts[0]
+    timestamp_str = parts[1]
+
+    <span class="hljs-keyword">if</span> status not <span class="hljs-keyword">in</span> [<span class="hljs-string">"OK"</span>, <span class="hljs-string">"ERROR"</span>]:
+        raise ValueError(f<span class="hljs-string">"Invalid status: '{status}' (expected OK or ERROR)"</span>)
+
+    <span class="hljs-comment"># Parse timestamp (ISO format with timezone)</span>
+    try:
+        timestamp = datetime.fromisoformat(timestamp_str)
+    except ValueError as e:
+        raise ValueError(f<span class="hljs-string">"Invalid timestamp format: '{timestamp_str}': {e}"</span>)
+
+    <span class="hljs-comment"># Ensure timestamp is timezone-aware</span>
+    <span class="hljs-keyword">if</span> timestamp.tzinfo is None:
+        raise ValueError(f<span class="hljs-string">"Timestamp is not timezone-aware: '{timestamp_str}'"</span>)
+
+    <span class="hljs-comment"># Parse line 2: ALERT_TYPE</span>
+    <span class="hljs-keyword">if</span> not lines[1].startswith(<span class="hljs-string">"ALERT_TYPE: "</span>):
+        raise ValueError(f<span class="hljs-string">"Invalid ALERT_TYPE line: '{lines[1]}'"</span>)
+    alert_type = lines[1].replace(<span class="hljs-string">"ALERT_TYPE: "</span>, <span class="hljs-string">""</span>).strip()
+
+    <span class="hljs-comment"># Parse line 3: TIMEZONE</span>
+    <span class="hljs-keyword">if</span> not lines[2].startswith(<span class="hljs-string">"TIMEZONE: "</span>):
+        raise ValueError(f<span class="hljs-string">"Invalid TIMEZONE line: '{lines[2]}'"</span>)
+    timezone = lines[2].replace(<span class="hljs-string">"TIMEZONE: "</span>, <span class="hljs-string">""</span>).strip()
+
+    result = {
+        <span class="hljs-string">'status'</span>: status,
+        <span class="hljs-string">'timestamp'</span>: timestamp,
+        <span class="hljs-string">'alert_type'</span>: alert_type,
+        <span class="hljs-string">'timezone'</span>: timezone
+    }
+
+    <span class="hljs-comment"># Parse line 4 (optional): ERROR_MSG</span>
+    <span class="hljs-keyword">if</span> len(lines) &gt;= 4 and lines[3].startswith(<span class="hljs-string">"ERROR_MSG: "</span>):
+        error_msg = lines[3].replace(<span class="hljs-string">"ERROR_MSG: "</span>, <span class="hljs-string">""</span>).strip()
+        result[<span class="hljs-string">'error_msg'</span>] = error_msg
+
+    <span class="hljs-built_in">return</span> result
+
+
+def get_effective_timezone() -&gt; str:
+    <span class="hljs-string">""</span><span class="hljs-string">"
+    Determine which timezone to use for time calculations.
+
+    Precedence:
+        1. SCHEDULE_TIMES_TIMEZONE (if set)
+        2. TIMEZONE (if set)
+        3. UTC (default fallback)
+
+    Returns:
+        Timezone name (e.g., "</span>Europe/Athens<span class="hljs-string">", "</span>UTC<span class="hljs-string">")
+    "</span><span class="hljs-string">""</span>
+    schedule_tz = os.getenv(<span class="hljs-string">'SCHEDULE_TIMES_TIMEZONE'</span>, <span class="hljs-string">''</span>).strip()
+    <span class="hljs-keyword">if</span> schedule_tz:
+        <span class="hljs-built_in">return</span> schedule_tz
+
+    general_tz = os.getenv(<span class="hljs-string">'TIMEZONE'</span>, <span class="hljs-string">''</span>).strip()
+    <span class="hljs-keyword">if</span> general_tz:
+        <span class="hljs-built_in">return</span> general_tz
+
+    <span class="hljs-built_in">return</span> <span class="hljs-string">'UTC'</span>
+
+
+def validate_health_file_structure(health_file: Path) -&gt; None:
+    <span class="hljs-string">""</span><span class="hljs-string">"
+    Perform initial validation of health file structure before parsing.
+
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file is empty or has invalid structure
+    "</span><span class="hljs-string">""</span>
+    <span class="hljs-keyword">if</span> not health_file.exists():
+        raise FileNotFoundError(f<span class="hljs-string">"Health file not found: {health_file}"</span>)
+
+    <span class="hljs-built_in">stat</span> = health_file.stat()
+    <span class="hljs-keyword">if</span> stat.st_size == 0:
+        raise ValueError(<span class="hljs-string">"Health file is empty"</span>)
+
+    <span class="hljs-keyword">if</span> stat.st_size &gt; 10000:  <span class="hljs-comment"># 10KB limit</span>
+        raise ValueError(f<span class="hljs-string">"Health file is too large: {stat.st_size} bytes (max 10KB)"</span>)
+
+
 def calculate_max_age() -&gt; <span class="hljs-built_in">float</span>:
-    <span class="hljs-string">""</span><span class="hljs-string">"Calculate maximum allowed age for health_status.txt based on schedule mode."</span><span class="hljs-string">""</span>
+    <span class="hljs-string">""</span><span class="hljs-string">"
+    Calculate maximum allowed age for health_status.txt based on schedule mode.
+
+    Returns:
+        Maximum age in minutes
+    "</span><span class="hljs-string">""</span>
     freq_hours = os.getenv(<span class="hljs-string">'SCHEDULE_FREQUENCY_HOURS'</span>, <span class="hljs-string">''</span>).strip()
     schedule_times = os.getenv(<span class="hljs-string">'SCHEDULE_TIMES'</span>, <span class="hljs-string">''</span>).strip()
-    
+
     <span class="hljs-comment"># Mode 1: Frequency-based (e.g., every 2 hours)</span>
     <span class="hljs-keyword">if</span> freq_hours:
         try:
             hours = <span class="hljs-built_in">float</span>(freq_hours)
-            <span class="hljs-built_in">return</span> hours * 60 + 10  <span class="hljs-comment"># Allow schedule interval + 10 minute buffer</span>
+            <span class="hljs-comment"># Allow schedule interval + 10 minute buffer</span>
+            <span class="hljs-built_in">return</span> hours * 60 + 10
         except (ValueError, TypeError):
             <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Invalid SCHEDULE_FREQUENCY_HOURS: {freq_hours}"</span>, file=sys.stderr)
             <span class="hljs-built_in">return</span> 70  <span class="hljs-comment"># Default fallback: 1 hour + 10 min buffer</span>
-    
+
     <span class="hljs-comment"># Mode 2: Specific times (e.g., 12:00,18:00)</span>
     <span class="hljs-keyword">elif</span> schedule_times:
         try:
             <span class="hljs-built_in">return</span> calculate_max_age_from_times(schedule_times)
         except Exception as e:
             <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Error calculating age from SCHEDULE_TIMES: {e}"</span>, file=sys.stderr)
-            <span class="hljs-built_in">return</span> 70
-    
+            <span class="hljs-built_in">return</span> 70  <span class="hljs-comment"># Default fallback</span>
+
     <span class="hljs-comment"># Mode 3: No schedule defined (default to hourly + buffer)</span>
     <span class="hljs-keyword">else</span>:
         <span class="hljs-built_in">print</span>(<span class="hljs-string">"Warning: Neither SCHEDULE_FREQUENCY_HOURS nor SCHEDULE_TIMES set"</span>, file=sys.stderr)
-        <span class="hljs-built_in">return</span> 70
+        <span class="hljs-built_in">return</span> 70  <span class="hljs-comment"># 1 hour + 10 minute buffer</span>
 
 
 def calculate_max_age_from_times(schedule_times: str) -&gt; <span class="hljs-built_in">float</span>:
-    <span class="hljs-string">""</span><span class="hljs-string">"Calculate maximum age based on SCHEDULE_TIMES."</span><span class="hljs-string">""</span>
-    now = datetime.now()
+    <span class="hljs-string">""</span><span class="hljs-string">"
+    Calculate maximum age based on SCHEDULE_TIMES.
+
+    For times like "</span>12:00,18:00<span class="hljs-string">", the health file should be updated within
+    10 minutes after the most recent scheduled time.
+
+    Uses the effective timezone (SCHEDULE_TIMES_TIMEZONE or TIMEZONE) for
+    determining "</span>now<span class="hljs-string">" and calculating schedule times.
+
+    Args:
+        schedule_times: Comma-separated list of times (HH:MM format)
+
+    Returns:
+        Maximum age in minutes (time since most recent scheduled time + 10 min buffer)
+
+    Note:
+        This function uses timezone-aware datetime calculations to ensure
+        correct behavior across different timezones.
+    "</span><span class="hljs-string">""</span>
+    <span class="hljs-comment"># Get timezone-aware "now"</span>
+    tz_name = get_effective_timezone()
+    try:
+        now = datetime.now(tz=ZoneInfo(tz_name))
+    except Exception as e:
+        <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Invalid timezone '{tz_name}': {e}, falling back to UTC"</span>, file=sys.stderr)
+        now = datetime.now(tz=ZoneInfo(<span class="hljs-string">'UTC'</span>))
+
+    <span class="hljs-comment"># Parse all scheduled times</span>
     time_list = [t.strip() <span class="hljs-keyword">for</span> t <span class="hljs-keyword">in</span> schedule_times.split(<span class="hljs-string">','</span>)]
     scheduled_datetimes = []
-    
+
     <span class="hljs-keyword">for</span> time_str <span class="hljs-keyword">in</span> time_list:
         try:
             hour, minute = map(int, time_str.split(<span class="hljs-string">':'</span>))
+
+            <span class="hljs-comment"># Create timezone-aware datetime for today</span>
             scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             scheduled_datetimes.append(scheduled_today)
+
+            <span class="hljs-comment"># Also consider yesterday's schedule</span>
             scheduled_yesterday = scheduled_today - timedelta(days=1)
             scheduled_datetimes.append(scheduled_yesterday)
+
         except (ValueError, IndexError) as e:
             <span class="hljs-built_in">print</span>(f<span class="hljs-string">"Invalid time format '{time_str}': {e}"</span>, file=sys.stderr)
             <span class="hljs-built_in">continue</span>
-    
+
     <span class="hljs-keyword">if</span> not scheduled_datetimes:
         <span class="hljs-built_in">print</span>(<span class="hljs-string">"No valid times found in SCHEDULE_TIMES"</span>, file=sys.stderr)
         <span class="hljs-built_in">return</span> 70
-    
+
+    <span class="hljs-comment"># Find the most recent scheduled time that has passed</span>
     past_times = [dt <span class="hljs-keyword">for</span> dt <span class="hljs-keyword">in</span> scheduled_datetimes <span class="hljs-keyword">if</span> dt &lt;= now]
+
     <span class="hljs-keyword">if</span> not past_times:
+        <span class="hljs-comment"># No scheduled time has passed yet today - use most recent from yesterday</span>
         past_times = sorted(scheduled_datetimes)
-    
+
     most_recent = max(past_times)
+
+    <span class="hljs-comment"># Calculate minutes since most recent scheduled time</span>
     minutes_since = (now - most_recent).total_seconds() / 60
-    <span class="hljs-built_in">return</span> minutes_since + 10  <span class="hljs-comment"># Add 10 minute buffer</span>
+
+    <span class="hljs-comment"># Allow the time since last schedule + 10 minute buffer</span>
+    <span class="hljs-built_in">return</span> minutes_since + 10
 
 
 <span class="hljs-keyword">if</span> __name__ == <span class="hljs-string">"__main__"</span>:
@@ -600,7 +827,15 @@ docker inspect &lt;container-name&gt; | grep -A 20 Health
 
 <span class="hljs-comment"># Test healthcheck manually</span>
 docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 /app/scripts/healthcheck.py
-<span class="hljs-comment"># Should output: "Healthy (file age: X/Y minutes)"</span>
+<span class="hljs-comment"># Expected output: Healthy (status: OK, alert: AlertClassName, age: X/Y minutes)</span>
+
+<span class="hljs-comment"># Check the health file directly</span>
+docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; cat /app/logs/health_status.txt
+<span class="hljs-comment"># Should show structured format with OK/ERROR, timestamp, alert type, timezone</span>
+
+<span class="hljs-comment"># Verify environment variables</span>
+docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; env | grep SCHEDULE
+<span class="hljs-comment"># Should show SCHEDULE_FREQUENCY_HOURS or SCHEDULE_TIMES</span>
 </div></code></pre>
 <p><strong>Repeat Step 2-4 for each project:</strong></p>
 <ul>
@@ -695,6 +930,46 @@ vim .env
 docker compose up -d
 
 <span class="hljs-comment"># Should become healthy again</span>
+</div></code></pre>
+<h3 id="testing-healthcheck-failures">Testing Healthcheck Failures</h3>
+<p><strong>Method 1: Simulate old timestamp (recommended):</strong></p>
+<pre class="hljs"><code><div>docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 &lt;&lt; <span class="hljs-string">'EOF'</span>
+from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+health_file = Path(<span class="hljs-string">"/app/logs/health_status.txt"</span>)
+old_time = datetime.now(tz=ZoneInfo(<span class="hljs-string">"Europe/Athens"</span>)) - timedelta(hours=2)
+
+with open(health_file, <span class="hljs-string">'w'</span>) as f:
+    f.write(f<span class="hljs-string">"OK {old_time.isoformat()}\n"</span>)
+    f.write(f<span class="hljs-string">"ALERT_TYPE: YourAlertClassName\n"</span>)
+    f.write(f<span class="hljs-string">"TIMEZONE: Europe/Athens\n"</span>)
+
+<span class="hljs-built_in">print</span>(f<span class="hljs-string">"Set timestamp to 2 hours ago"</span>)
+EOF
+
+<span class="hljs-comment"># Test healthcheck - should fail</span>
+docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 /app/scripts/healthcheck.py
+</div></code></pre>
+<p><strong>Method 2: Simulate ERROR status:</strong></p>
+<pre class="hljs"><code><div>docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 &lt;&lt; <span class="hljs-string">'EOF'</span>
+from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+health_file = Path(<span class="hljs-string">"/app/logs/health_status.txt"</span>)
+now = datetime.now(tz=ZoneInfo(<span class="hljs-string">"Europe/Athens"</span>))
+
+with open(health_file, <span class="hljs-string">'w'</span>) as f:
+    f.write(f<span class="hljs-string">"ERROR {now.isoformat()}\n"</span>)
+    f.write(f<span class="hljs-string">"ALERT_TYPE: YourAlertClassName\n"</span>)
+    f.write(f<span class="hljs-string">"TIMEZONE: Europe/Athens\n"</span>)
+    f.write(f<span class="hljs-string">"ERROR_MSG: Simulated database failure\n"</span>)
+EOF
+
+<span class="hljs-comment"># Test healthcheck - should fail</span>
+docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 /app/scripts/healthcheck.py
 </div></code></pre>
 <h3 id="step-7-optional---configure-project-specific-routing">Step 7: Optional - Configure Project-Specific Routing</h3>
 <p>If you want different teams to receive alerts for different projects:</p>
@@ -1351,6 +1626,31 @@ docker <span class="hljs-built_in">exec</span> &lt;container-name&gt; python3 /a
 <span class="hljs-comment"># Watch healthcheck in real-time</span>
 watch -n 5 <span class="hljs-string">'docker ps --format "table {{.Names}}\t{{.Status}}"'</span>
 </div></code></pre>
+<h2 id="health-status-file-format">Health Status File Format</h2>
+<p>The <code>base_alert.py</code> writes a structured health status file that the healthcheck script validates:</p>
+<pre class="hljs"><code><div>OK 2025-12-16T12:05:30+02:00
+ALERT_TYPE: MastersNavigationAuditAlert
+TIMEZONE: Europe/Athens
+</div></code></pre>
+<p>Or for errors:</p>
+<pre class="hljs"><code><div>ERROR 2025-12-16T12:05:30+02:00
+ALERT_TYPE: MastersNavigationAuditAlert
+TIMEZONE: Europe/Athens
+ERROR_MSG: Database connection timeout after 30 seconds
+</div></code></pre>
+<p><strong>Format rules:</strong></p>
+<ul>
+<li>Line 1: <code>STATUS TIMESTAMP</code> (STATUS is &quot;OK&quot; or &quot;ERROR&quot;, TIMESTAMP is ISO 8601 with timezone)</li>
+<li>Line 2: <code>ALERT_TYPE: ClassName</code> (name of the alert class)</li>
+<li>Line 3: <code>TIMEZONE: timezone_name</code> (e.g., &quot;Europe/Athens&quot;, &quot;UTC&quot;)</li>
+<li>Line 4 (optional): <code>ERROR_MSG: message</code> (only present if STATUS is ERROR)</li>
+</ul>
+<p><strong>Timezone handling:</strong></p>
+<ul>
+<li>The timestamp in line 1 is timezone-aware (includes +HH:MM offset)</li>
+<li>The healthcheck uses <code>SCHEDULE_TIMES_TIMEZONE</code> (if set), then <code>TIMEZONE</code>, then defaults to UTC</li>
+<li>File age is calculated using timezone-aware datetime arithmetic</li>
+</ul>
 <h2 id="usage">Usage</h2>
 <h3 id="running-the-monitor">Running the Monitor</h3>
 <p><strong>Foreground (for testing):</strong></p>
@@ -1817,6 +2117,14 @@ A: Yes, temporarily set <code>WAIT_AND_CHECK_AGAIN_MIN=1</code> in .env</p>
 A: Yes! The script uses relative paths and works on Mac, Ubuntu, and other Linux distributions.</p>
 <p><strong>Q: What's the difference between port 465 and 587?</strong><br>
 A: Port 587 uses STARTTLS (most common), port 465 uses direct SSL. The script detects and uses the appropriate method automatically.</p>
+<p><strong>Q: How do I find my container name for <code>docker exec</code>?</strong>
+A: Run <code>docker ps --format &quot;{{.Names}}&quot;</code> to list all container names. Use the name from the NAMES column, not the service name from docker-compose.yml.</p>
+<p><strong>Q: Why does my healthcheck show a different max age than expected?</strong>
+A: The max age is calculated as: <code>SCHEDULE_FREQUENCY_HOURS × 60 + 10 minutes buffer</code>. For time-based schedules, it's <code>minutes since last scheduled time + 10 minutes</code>. Check your <code>SCHEDULE_FREQUENCY_HOURS</code> or <code>SCHEDULE_TIMES</code> environment variable.</p>
+<p><strong>Q: What timezone does the healthcheck use?</strong>
+A: Priority order: <code>SCHEDULE_TIMES_TIMEZONE</code> &gt; <code>TIMEZONE</code> &gt; UTC (default). Set <code>SCHEDULE_TIMES_TIMEZONE=Europe/Athens</code> in your project's <code>.env</code> for time-based schedules.</p>
+<p><strong>Q: Can I test the healthcheck without waiting for it to fail naturally?</strong>
+A: Yes, use the Python method in &quot;Testing Healthcheck Failures&quot; to write an old timestamp or ERROR status to the health file, then run the healthcheck script manually.</p>
 <h2 id="performance-characteristics">Performance Characteristics</h2>
 <p><strong>CPU:</strong></p>
 <ul>
@@ -1852,7 +2160,16 @@ A: Port 587 uses STARTTLS (most common), port 465 uses direct SSL. The script de
 <li>Check Docker permissions: <code>docker ps</code></li>
 </ol>
 <h2 id="changes-from-previous-versions">Changes from Previous Versions</h2>
-<p><strong>Version 2.1 (Current):</strong></p>
+<p><strong>Version 2.2 (Current):</strong></p>
+<ul>
+<li>Added timezone-aware healthcheck with structured file parsing</li>
+<li>Added <code>parse_health_file()</code> for robust health status validation</li>
+<li>Added <code>get_effective_timezone()</code> for timezone precedence</li>
+<li>Improved error messages with status, alert type, and age information</li>
+<li>Added atomic write in <code>base_alert.py</code> to prevent file corruption</li>
+<li>Enhanced documentation for testing and troubleshooting</li>
+</ul>
+<p><strong>Version 2.1:</strong></p>
 <ul>
 <li>Fixed <code>became_unhealthy</code> logic to trigger on <code>unknown→unhealthy</code> transitions</li>
 <li>Added interruptible sleep with 1-second intervals</li>
@@ -1867,7 +2184,7 @@ A: Port 587 uses STARTTLS (most common), port 465 uses direct SSL. The script de
 <li>Project-aware alerting</li>
 </ul>
 <hr>
-<p><strong>Version:</strong> 2.1<br>
+<p><strong>Version:</strong> 2.2<br>
 <strong>Last Updated:</strong> December 2025<br>
 <strong>Python Version:</strong> 3.7+<br>
 <strong>Docker API Version:</strong> Compatible with Docker Engine 19.03+<br>
