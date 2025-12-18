@@ -312,10 +312,10 @@ class MultiProjectHealthMonitor:
         
         # Determine alert severity
         if status == 'unhealthy':
-            emoji = '!?!?!?'
+            emoji = '!?'
             severity = 'CRITICAL'
         elif status == 'not_found':
-            emoji = '!?!?'
+            emoji = '!?'
             severity = 'ERROR'
         elif status == 'starting':
             emoji = '!?'
