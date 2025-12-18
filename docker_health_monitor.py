@@ -411,12 +411,21 @@ Monitoring all containers with healthchecks
         
         # Send email
         try:
-            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port) as server:
-                server.login(self.smtp_user, self.smtp_pass)
-                server.send_message(msg)
+            if self.smtp_port == 587:
+                # Use STARTTLS for port 587
+                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
+                    server.starttls()
+                    server.login(self.smtp_user, self.smtp_pass)
+                    server.send_message(msg)
+            else:
+                # Use SSL for port 465
+                with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=30) as server:
+                    server.login(self.smtp_user, self.smtp_pass)
+                    server.send_message(msg)
             logger.info(f"✓ Alert sent for [{project_name}] {container_name} to {', '.join(recipients)}")
         except Exception as e:
             logger.error(f"✗ Failed to send alert email: {e}")
+
     
     def check_single_container(self, container) -> ContainerHealthCheck:
         """
