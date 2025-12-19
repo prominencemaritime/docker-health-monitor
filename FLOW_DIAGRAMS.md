@@ -2,8 +2,7 @@
 
 ## src/core/base_alert.py Workflow with Healthcheck Failures
 
-Flow diagram showing the `src/core/base_alert.py` workflow with healthcheck failure conditions:
-
+*Shows the complete execution flow of the alert system's run() method, including all success paths (writing OK status) and failure paths (writing ERROR status with exception details)*
 ```mermaid
 flowchart TD
     Start([alert.run<br/>called]) --> Init[Initialize run_time<br/>Log: RUN STARTED]
@@ -93,61 +92,74 @@ flowchart TD
 
 ## Healthcheck Failure Conditions Diagram
 
-Here's a focused diagram showing when healthcheck will **FAIL**:
-
+*Shows the healthcheck script's validation logic: file existence → structure validation → structured parsing → status check (OK/ERROR) → timezone-aware age calculation → pass/fail determination*
 ```mermaid
 flowchart TD
     HC([Docker Healthcheck<br/>python3 healthcheck.py]) --> CheckFile{health_status.txt<br/>exists?}
     
-    CheckFile -->|No| Fail1[❌ EXIT 1<br/>Health status file not found]
-    CheckFile -->|Yes| ReadFile[Read file content]
+    CheckFile -->|No| Fail1[❌ EXIT 1<br/>Health file not found]
+    CheckFile -->|Yes| ValidateStruct[Validate file structure<br/>Size, line count]
     
-    ReadFile --> ReadError{Can read<br/>file?}
-    ReadError -->|No| Fail2[❌ EXIT 1<br/>Cannot read health status]
-    ReadError -->|Yes| CheckOK{Content starts<br/>with OK?}
+    ValidateStruct --> StructError{Valid<br/>structure?}
+    StructError -->|No| Fail2[❌ EXIT 1<br/>Invalid file structure<br/>Empty or malformed]
+    StructError -->|Yes| ParseFile[Parse structured format<br/>Line 1: STATUS TIMESTAMP<br/>Line 2: ALERT_TYPE<br/>Line 3: TIMEZONE<br/>Line 4: ERROR_MSG optional]
     
-    CheckOK -->|No ERROR| Fail3[❌ EXIT 1<br/>Health status is not OK<br/>Show: ERROR message]
-    CheckOK -->|Yes| GetTime[Get file modification time]
+    ParseFile --> ParseError{Can parse<br/>file?}
+    ParseError -->|No| Fail3[❌ EXIT 1<br/>Parse failed<br/>Invalid format]
+    ParseError -->|Yes| CheckStatus{Status in<br/>Line 1?}
     
-    GetTime --> CalcAge[Calculate file age in minutes]
-    CalcAge --> CheckSchedule{Schedule<br/>Mode?}
+    CheckStatus -->|ERROR| Fail4[❌ EXIT 1<br/>Health status is ERROR<br/>Show: ERROR_MSG]
+    CheckStatus -->|OK| GetTZ[Get effective timezone<br/>SCHEDULE_TIMES_TIMEZONE<br/>then TIMEZONE then UTC]
+    
+    GetTZ --> CalcMaxAge[Calculate max_age based on<br/>schedule mode]
+    
+    CalcMaxAge --> CheckSchedule{Schedule<br/>Mode?}
     
     CheckSchedule -->|FREQUENCY| CalcFreq[max_age = HOURS × 60 + 10]
     CheckSchedule -->|TIMES| CalcTimes[max_age = time_since_last + 10]
     CheckSchedule -->|Neither| CalcDefault[max_age = 70 minutes]
     
-    CalcFreq --> CompareAge
-    CalcTimes --> CompareAge
-    CalcDefault --> CompareAge
+    CalcFreq --> ParseTimestamp
+    CalcTimes --> ParseTimestamp
+    CalcDefault --> ParseTimestamp
     
-    CompareAge{file_age ><br/>max_age?}
+    ParseTimestamp[Parse ISO timestamp<br/>from Line 1<br/>Timezone-aware]
     
-    CompareAge -->|Yes| Fail4[❌ EXIT 1<br/>Health status file is too old<br/>Show: X minutes / Y max]
-    CompareAge -->|No| Success[✅ EXIT 0<br/>Healthy<br/>Show: X minutes / Y max]
+    ParseTimestamp --> TZError{Timestamp<br/>valid?}
+    TZError -->|No| Fail5[❌ EXIT 1<br/>Invalid timestamp<br/>Not timezone-aware]
+    TZError -->|Yes| CalcAge[Calculate age using<br/>timezone-aware datetime<br/>now minus timestamp]
+    
+    CalcAge --> CompareAge{file_age ><br/>max_age?}
+    
+    CompareAge -->|Yes| Fail6[❌ EXIT 1<br/>Health status too old<br/>Show: age slash max_age minutes]
+    CompareAge -->|No| Success[✅ EXIT 0<br/>Healthy<br/>status: OK, age: X slash Y min]
     
     style Fail1 fill:#FF6B6B
     style Fail2 fill:#FF6B6B
     style Fail3 fill:#FF6B6B
     style Fail4 fill:#FF6B6B
+    style Fail5 fill:#FF6B6B
+    style Fail6 fill:#FF6B6B
     style Success fill:#90EE90
 ```
 
 ## Conditions That Cause Healthcheck Failure
 
+*Maps the four healthcheck failure reasons (file missing, unreadable, ERROR status, too old) to their root causes in the alert application and infrastructure*
 ```mermaid
 flowchart LR
     subgraph Reasons[Healthcheck FAILS When]
-        R1[File Missing<br/>/app/logs/health_status.txt<br/>does not exist]
+        R1[File Missing<br/>app logs health_status.txt<br/>does not exist]
         R2[File Unreadable<br/>Permission error or<br/>I/O error]
         R3[Status = ERROR<br/>File starts with ERROR<br/>not OK]
-        R4[File Too Old<br/>Modified time exceeds<br/>schedule + 10 min buffer]
+        R4[File Too Old<br/>Modified time exceeds<br/>schedule plus 10 min buffer]
     end
     
     subgraph Causes[What Causes These]
         C1[App never ran<br/>Container just started]
         C2[App crashed before<br/>writing health file]
         C3[Exception in run<br/>method caught by<br/>except block]
-        C4[Scheduler not running<br/>Cron/APScheduler failed<br/>Schedule misconfigured]
+        C4[Scheduler not running<br/>Cron or APScheduler failed<br/>Schedule misconfigured]
     end
     
     subgraph AppStates[base_alert.py States]
@@ -156,7 +168,7 @@ flowchart LR
         S3[filter_data exception]
         S4[tracker exception]
         S5[route_notifications exception]
-        S6[_send_notifications exception]
+        S6[send_notifications exception]
         S7[Database connection failed]
         S8[SMTP connection failed]
         S9[Missing required columns]
@@ -196,31 +208,32 @@ flowchart LR
 
 ## Complete Integration Flow
 
+*End-to-end system view: scheduler triggers alert application → writes health status file → Docker healthcheck reads file → reports to Docker Engine → health monitor detects unhealthy containers → Phase 2 recheck → sends email alerts*
 ```mermaid
 flowchart TD
     subgraph Container[Docker Container]
-        App[Python Application<br/>src/main.py]
+        App[Python Application<br/>src main.py]
         Alert[BaseAlert.run]
-        Health[/app/logs/<br/>health_status.txt]
-        HCScript[scripts/healthcheck.py]
+        Health[app logs<br/>health_status.txt]
+        HCScript[scripts healthcheck.py]
     end
     
     subgraph Docker[Docker Engine]
-        HealthCheck[HEALTHCHECK<br/>--interval=2m]
-        Status[Container Status:<br/>healthy/unhealthy/starting]
+        HealthCheck[HEALTHCHECK<br/>interval 2m]
+        Status[Container Status<br/>healthy unhealthy starting]
     end
     
     subgraph Monitor[Health Monitor]
-        Phase1[Phase 1:<br/>Check All Containers]
-        Phase2[Phase 2:<br/>Recheck Unhealthy]
+        Phase1[Phase 1<br/>Check All Containers]
+        Phase2[Phase 2<br/>Recheck Unhealthy]
         Email[Send Alert Email<br/>with Logs]
     end
     
-    Schedule[Scheduler<br/>APScheduler/Cron] -->|Triggers| App
+    Schedule[Scheduler<br/>APScheduler or Cron] -->|Triggers| App
     App -->|Calls| Alert
     
-    Alert -->|Success| WriteOK[Write: OK + timestamp]
-    Alert -->|Exception| WriteERROR[Write: ERROR + msg]
+    Alert -->|Success| WriteOK[Write OK plus timestamp]
+    Alert -->|Exception| WriteERROR[Write ERROR plus msg]
     
     WriteOK -->|Updates| Health
     WriteERROR -->|Updates| Health
@@ -247,54 +260,64 @@ flowchart TD
 
 ## Example Error Scenarios
 
+### Scenario 1: Database Down
+*Alert application encounters database connection error → writes ERROR to health file → healthcheck detects ERROR status → container marked unhealthy → Phase 2 confirms and sends alert*
 ```mermaid
-flowchart TD
-    subgraph Scenario1[Scenario 1: Database Down]
-        S1A[12:00 - Scheduler triggers]
-        S1B[fetch_data raises<br/>psycopg2.OperationalError]
-        S1C[Exception caught<br/>logs full traceback]
-        S1D[Writes: ERROR<br/>Database connection failed]
-        S1E[12:02 - Healthcheck runs]
-        S1F[Reads: ERROR]
-        S1G[Container: unhealthy]
-        S1H[12:17 - Phase 2 recheck]
-        S1I[Still: unhealthy]
-        S1J[Alert sent with logs]
-    end
-    
-    subgraph Scenario2[Scenario 2: SMTP Failed]
-        S2A[12:00 - Scheduler triggers]
-        S2B[fetch_data: OK]
-        S2C[filter_data: OK]
-        S2D[route_notifications: OK]
-        S2E[_send_notifications<br/>SMTP error in loop]
-        S2F[Logs: Failed to send<br/>BUT continues]
-        S2G[Writes: OK<br/>partial success]
-        S2H[Container: healthy]
-        S2I[No alert sent<br/>but error in logs]
-    end
-    
-    subgraph Scenario3[Scenario 3: Scheduler Not Running]
-        S3A[12:00 - No trigger<br/>Scheduler crashed]
-        S3B[health_status.txt<br/>last modified: 06:00]
-        S3C[12:02 - Healthcheck runs]
-        S3D[File age: 362 minutes]
-        S3E[Max age: 130 minutes<br/>FREQUENCY_HOURS=2]
-        S3F[File too old]
-        S3G[Container: unhealthy]
-        S3H[12:17 - Alert sent]
-    end
+flowchart LR
+    S1A[12:00<br/>Scheduler<br/>triggers]
+    S1B[fetch_data<br/>raises<br/>OperationalError]
+    S1C[Exception<br/>caught<br/>logs traceback]
+    S1D[Writes<br/>ERROR<br/>DB failed]
+    S1E[12:02<br/>Healthcheck<br/>runs]
+    S1F[Reads<br/>ERROR]
+    S1G[Container<br/>unhealthy]
+    S1H[12:17<br/>Phase 2<br/>recheck]
+    S1I[Still<br/>unhealthy]
+    S1J[Alert sent<br/>with logs]
     
     S1A --> S1B --> S1C --> S1D --> S1E --> S1F --> S1G --> S1H --> S1I --> S1J
-    S2A --> S2B --> S2C --> S2D --> S2E --> S2F --> S2G --> S2H --> S2I
-    S3A --> S3B --> S3C --> S3D --> S3E --> S3F --> S3G --> S3H
     
     style S1D fill:#FF6B6B
     style S1G fill:#FF6B6B
     style S1J fill:#FFB6C1
+```
+
+### Scenario 2: SMTP Failed
+*Alert application runs successfully but SMTP fails during notification sending → still writes OK (partial success) → container stays healthy → no external alert sent but error logged*
+```mermaid
+flowchart LR
+    S2A[12:00<br/>Scheduler<br/>triggers]
+    S2B[fetch_data<br/>OK]
+    S2C[filter_data<br/>OK]
+    S2D[route_notifications<br/>OK]
+    S2E[send_notifications<br/>SMTP error]
+    S2F[Logs<br/>Failed to send<br/>continues]
+    S2G[Writes<br/>OK<br/>partial success]
+    S2H[Container<br/>healthy]
+    S2I[No alert<br/>error in logs]
+    
+    S2A --> S2B --> S2C --> S2D --> S2E --> S2F --> S2G --> S2H --> S2I
+    
     style S2G fill:#90EE90
     style S2H fill:#90EE90
     style S2I fill:#FFE4B5
+```
+
+### Scenario 3: Scheduler Not Running
+*Scheduler crashes and stops triggering alert application → health file becomes stale (6 hours old) → healthcheck detects file age exceeds maximum → container marked unhealthy → alert sent*
+```mermaid
+flowchart LR
+    S3A[12:00<br/>No trigger<br/>Crashed]
+    S3B[health_status.txt<br/>modified 06:00]
+    S3C[12:02<br/>Healthcheck<br/>runs]
+    S3D[File age<br/>362 min]
+    S3E[Max age<br/>130 min]
+    S3F[File<br/>too old]
+    S3G[Container<br/>unhealthy]
+    S3H[12:17<br/>Alert sent]
+    
+    S3A --> S3B --> S3C --> S3D --> S3E --> S3F --> S3G --> S3H
+    
     style S3F fill:#FF6B6B
     style S3G fill:#FF6B6B
 ```
@@ -317,4 +340,3 @@ These diagrams make it crystal clear:
 2. **When healthchecks fail** (red paths)
 3. **What exceptions in `base_alert.py` lead to failures**
 4. **How the monitoring system responds**
-
